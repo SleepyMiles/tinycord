@@ -20,10 +20,41 @@ fn init_log() {
     }
 }
 
+/// Lists audio devices on a background thread. The first time it sees a
+/// Krisp microphone (and no mic was picked before), it selects it and turns
+/// off tinycord's own noise suppression so the audio isn't cleaned twice.
+pub fn refresh_devices() {
+    std::thread::spawn(|| {
+        let (ins, outs) = audio::list_devices();
+        let mut s = state::state();
+        let mut picked_krisp = false;
+        if !s.mic_chosen {
+            if let Some(k) = ins.iter().find(|n| n.to_lowercase().contains("krisp")) {
+                s.mic_device = Some(k.clone());
+                s.mic_chosen = true;
+                picked_krisp = true;
+            }
+        }
+        s.input_devices = ins;
+        s.output_devices = outs;
+        drop(s);
+        if picked_krisp {
+            voice::shared()
+                .noise_suppression
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            store::save_settings();
+            state::set_status("Using Krisp Microphone");
+            state::send(state::Cmd::RestartAudio);
+        }
+        state::changed();
+    });
+}
+
 fn main() {
     init_log();
     tracing::info!("tinycord {} starting", env!("CARGO_PKG_VERSION"));
     store::load_settings();
+    refresh_devices();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     state::set_cmd_sender(tx);

@@ -60,6 +60,13 @@ pub struct State {
     pub overlay: u8,
     pub overlay_speakers_only: bool,
     pub selected_guild: u64,
+    /// Chosen devices by name; None = Windows default.
+    pub mic_device: Option<String>,
+    pub spk_device: Option<String>,
+    /// True once a mic choice was saved (so we only auto-pick Krisp once).
+    pub mic_chosen: bool,
+    pub input_devices: Vec<String>,
+    pub output_devices: Vec<String>,
 }
 
 impl State {
@@ -121,6 +128,11 @@ fn cell() -> &'static Mutex<State> {
             overlay: 2,
             overlay_speakers_only: false,
             selected_guild: 0,
+            mic_device: None,
+            spk_device: None,
+            mic_chosen: false,
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
         })
     })
 }
@@ -133,6 +145,7 @@ pub enum Cmd {
     Join(u64, u64),
     Leave,
     UpdateSelf,
+    RestartAudio,
 }
 
 static CMD: OnceLock<UnboundedSender<Cmd>> = OnceLock::new();

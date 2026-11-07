@@ -220,17 +220,64 @@ impl Drop for AudioHandle {
 
 /// Opens the default mic and speakers on a thread of their own (cpal streams
 /// must stay on the thread that made them). Dropping the handle closes both.
-pub fn start(shared: Arc<Shared>, deafened: Arc<AtomicBool>) -> AudioHandle {
+/// Names of the input and output devices Windows offers.
+pub fn list_devices() -> (Vec<String>, Vec<String>) {
+    let host = cpal::default_host();
+    let names = |it: Option<Vec<cpal::Device>>| -> Vec<String> {
+        let mut v: Vec<String> = it
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|d| d.description().ok().map(|x| x.name().to_string()))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let ins = names(host.input_devices().ok().map(|i| i.collect()));
+    let outs = names(host.output_devices().ok().map(|i| i.collect()));
+    (ins, outs)
+}
+
+fn find_device(want: &Option<String>, input: bool) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    if let Some(name) = want {
+        let found = if input {
+            host.input_devices().ok().and_then(|mut it| {
+                it.find(|d| d.description().map(|x| x.name() == name).unwrap_or(false))
+            })
+        } else {
+            host.output_devices().ok().and_then(|mut it| {
+                it.find(|d| d.description().map(|x| x.name() == name).unwrap_or(false))
+            })
+        };
+        if found.is_some() {
+            return found;
+        }
+        tracing::warn!("device {name:?} not found, using the default");
+    }
+    if input {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    }
+}
+
+pub fn start(
+    shared: Arc<Shared>,
+    deafened: Arc<AtomicBool>,
+    mic: Option<String>,
+    spk: Option<String>,
+) -> AudioHandle {
     let (tx, rx) = mpsc::channel::<()>();
     std::thread::Builder::new()
         .name("audio".into())
         .stack_size(256 * 1024)
         .spawn(move || {
             let host = cpal::default_host();
-            let input = host.default_input_device().and_then(|d| build_input(&d, shared.clone()));
-            let output = host
-                .default_output_device()
-                .and_then(|d| build_output(&d, shared.clone(), deafened.clone()));
+            let _ = &host;
+            let input = find_device(&mic, true).and_then(|d| build_input(&d, shared.clone()));
+            let output =
+                find_device(&spk, false).and_then(|d| build_output(&d, shared.clone(), deafened.clone()));
             match (&input, &output) {
                 (None, _) => crate::state::set_status("No microphone found"),
                 (_, None) => crate::state::set_status("No speakers found"),

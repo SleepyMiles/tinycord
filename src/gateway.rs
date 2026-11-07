@@ -274,6 +274,7 @@ fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out: &mut
             *pend = Pending::default();
             state::set_status("Left voice");
         }
+        Cmd::RestartAudio => voice::restart_audio(v),
         Cmd::UpdateSelf => {
             let current = state().joined;
             if let Some((g, c)) = current {

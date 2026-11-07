@@ -30,7 +30,7 @@ static TRACK: Mutex<Option<TrackHandle>> = Mutex::new(None);
 
 pub struct Voice {
     driver: Driver,
-    _audio: AudioHandle,
+    audio: Option<AudioHandle>,
 }
 
 fn driver_config() -> Config {
@@ -72,7 +72,7 @@ pub async fn connect(cur: &mut Option<Voice>, info: ConnectionInfo) -> Result<()
     })?;
     tracing::info!("voice connected");
 
-    let audio = audio::start(shared().clone(), deaf_flag().clone());
+    let audio = start_audio();
     let src = RawAdapter::new(MicSource::new(shared().clone()), audio::RATE as u32, 1);
     let input = Input::Live(
         LiveInput::Raw(AudioStream { input: Box::new(src) as Box<dyn songbird::input::core::io::MediaSource> }),
@@ -84,8 +84,25 @@ pub async fn connect(cur: &mut Option<Voice>, info: ConnectionInfo) -> Result<()
     }
     *TRACK.lock() = Some(handle);
 
-    *cur = Some(Voice { driver, _audio: audio });
+    *cur = Some(Voice { driver, audio: Some(audio) });
     Ok(())
+}
+
+fn start_audio() -> AudioHandle {
+    let (mic, spk) = {
+        let s = state();
+        (s.mic_device.clone(), s.spk_device.clone())
+    };
+    audio::start(shared().clone(), deaf_flag().clone(), mic, spk)
+}
+
+/// Re-open the mic/speakers (after picking a different device).
+pub fn restart_audio(cur: &mut Option<Voice>) {
+    if let Some(v) = cur.as_mut() {
+        v.audio = None; // closes the old devices
+        std::thread::sleep(Duration::from_millis(100));
+        v.audio = Some(start_audio());
+    }
 }
 
 pub fn disconnect(cur: &mut Option<Voice>) {

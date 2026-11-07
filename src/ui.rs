@@ -34,6 +34,8 @@ const ID_SPK: i32 = 112;
 const ID_TOP: i32 = 113;
 const ID_NS: i32 = 114;
 const ID_AGC: i32 = 115;
+const ID_MIC: i32 = 116;
+const ID_SPKDEV: i32 = 117;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_TOPMOST: usize = 2;
@@ -68,7 +70,7 @@ struct Row {
 struct Ui {
     hwnd: HWND,
     overlay: HWND,
-    c: [HWND; 16],
+    c: [HWND; 18],
     font: HFONT,
     bold: HFONT,
     ofont: HFONT,
@@ -79,6 +81,7 @@ struct Ui {
     overlay_lines: Vec<(String, bool, bool)>,
     logged_in_shown: Option<bool>,
     keep_on_top: bool,
+    dev_cache: (Vec<String>, Vec<String>),
 }
 
 thread_local! {
@@ -197,7 +200,7 @@ pub fn run() {
             *u.borrow_mut() = Some(Ui {
                 hwnd: null_mut(),
                 overlay: null_mut(),
-                c: [null_mut(); 16],
+                c: [null_mut(); 18],
                 font: make_font(dpi, 9, FW_NORMAL as i32),
                 bold: make_font(dpi, 9, FW_BOLD as i32),
                 ofont: make_font(dpi, 11, FW_SEMIBOLD as i32),
@@ -208,11 +211,12 @@ pub fn run() {
                 overlay_lines: Vec::new(),
                 logged_in_shown: None,
                 keep_on_top: false,
+                dev_cache: (Vec::new(), Vec::new()),
             })
         });
 
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut r = RECT { left: 0, top: 0, right: sc(dpi, 280), bottom: sc(dpi, 458) };
+        let mut r = RECT { left: 0, top: 0, right: sc(dpi, 280), bottom: sc(dpi, 488) };
         AdjustWindowRect(&mut r, style, 0);
         let title = wide("tinycord");
         let hwnd = CreateWindowExW(
@@ -311,7 +315,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let cbo = |x, y, w, id| {
         child(hwnd, "COMBOBOX", "", ts | WS_VSCROLL | CBS_DROPDOWNLIST as u32, x, y, w, 300, id, dpi, font)
     };
-    let mut c = [null_mut(); 16];
+    let mut c = [null_mut(); 18];
     c[0] = child(hwnd, "STATIC", "Starting...", SS_LEFT as u32 | SS_ENDELLIPSIS as u32, 6, 6, 268, 18, ID_STATUS, dpi, font);
     c[1] = child(hwnd, "EDIT", "", ts | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32, 6, 28, 190, 24, ID_TOKEN, dpi, font);
     c[2] = b("Log in", BS_PUSHBUTTON, 202, 28, 72, 24, ID_LOGIN);
@@ -340,6 +344,10 @@ unsafe fn create_controls(hwnd: HWND) {
     c[13] = b("Keep on top", BS_AUTOCHECKBOX, 144, 406, 128, 22, ID_TOP);
     c[14] = b("Noise suppression", BS_AUTOCHECKBOX, 8, 430, 128, 22, ID_NS);
     c[15] = b("Auto gain", BS_AUTOCHECKBOX, 144, 430, 128, 22, ID_AGC);
+    c[16] = cbo(6, 458, 130, ID_MIC);
+    c[17] = cbo(142, 458, 132, ID_SPKDEV);
+    SendMessageW(c[16], CB_SETDROPPEDWIDTH, sc(dpi, 320) as usize, 0);
+    SendMessageW(c[17], CB_SETDROPPEDWIDTH, sc(dpi, 320) as usize, 0);
 
     combo_add(c[8], &["Voice activation", "Push-to-talk", "Open mic"]);
     combo_add(c[10], &SENS.map(|s| s.0));
@@ -504,6 +512,31 @@ unsafe fn on_command(id: i32, code: u32) {
             let on = SendMessageW(c[15], BM_GETCHECK, 0, 0) == 1;
             crate::voice::shared().auto_gain.store(on, Ordering::Relaxed);
             store::save_settings();
+        }
+        (ID_MIC | ID_SPKDEV, CBN_DROPDOWN) => crate::refresh_devices(),
+        (ID_MIC, CBN_SELCHANGE) => {
+            let i = SendMessageW(c[16], CB_GETCURSEL, 0, 0);
+            let name = if i <= 0 { None } else { state().input_devices.get(i as usize - 1).cloned() };
+            let krisp = name.as_deref().is_some_and(|n| n.to_lowercase().contains("krisp"));
+            {
+                let mut s = state();
+                s.mic_device = name;
+                s.mic_chosen = true;
+            }
+            if krisp {
+                // Krisp already cleans the audio; doing it twice sounds worse.
+                crate::voice::shared().noise_suppression.store(false, Ordering::Relaxed);
+                SendMessageW(c[14], BM_SETCHECK, 0, 0);
+            }
+            store::save_settings();
+            state::send(Cmd::RestartAudio);
+        }
+        (ID_SPKDEV, CBN_SELCHANGE) => {
+            let i = SendMessageW(c[17], CB_GETCURSEL, 0, 0);
+            let name = if i <= 0 { None } else { state().output_devices.get(i as usize - 1).cloned() };
+            state().spk_device = name;
+            store::save_settings();
+            state::send(Cmd::RestartAudio);
         }
         (ID_TOP, BN_CLICKED) => {
             let on = SendMessageW(c[13], BM_GETCHECK, 0, 0) == 1;
@@ -721,7 +754,52 @@ unsafe fn refresh() {
     set_text(c[9], &key_txt);
     EnableWindow(c[9], (mode == MicMode::Ptt || key_txt.starts_with("Press")) as i32);
 
+    update_devices(&c);
+    SendMessageW(
+        c[14],
+        BM_SETCHECK,
+        crate::voice::shared().noise_suppression.load(Ordering::Relaxed) as usize,
+        0,
+    );
+
     update_overlay();
+}
+
+unsafe fn update_devices(c: &[HWND; 18]) {
+    let (ins, outs, mic, spk) = {
+        let s = state();
+        (s.input_devices.clone(), s.output_devices.clone(), s.mic_device.clone(), s.spk_device.clone())
+    };
+    let Some(cache) = with_ui(|u| u.dev_cache.clone()) else { return };
+    let fill = |h: HWND, label: &str, list: &[String]| {
+        SendMessageW(h, CB_RESETCONTENT, 0, 0);
+        let w = wide(label);
+        SendMessageW(h, CB_ADDSTRING, 0, w.as_ptr() as isize);
+        for n in list {
+            let w = wide(n);
+            SendMessageW(h, CB_ADDSTRING, 0, w.as_ptr() as isize);
+        }
+    };
+    if cache.0 != ins {
+        fill(c[16], "Mic: Windows default", &ins);
+    }
+    if cache.1 != outs {
+        fill(c[17], "Speakers: Windows default", &outs);
+    }
+    if cache.0 != ins || cache.1 != outs {
+        with_ui(|u| u.dev_cache = (ins.clone(), outs.clone()));
+    }
+    let pick = |list: &[String], want: &Option<String>| -> usize {
+        want.as_ref().and_then(|n| list.iter().position(|x| x == n)).map(|i| i + 1).unwrap_or(0)
+    };
+    let mi = pick(&ins, &mic);
+    let si = pick(&outs, &spk);
+    if SendMessageW(c[16], CB_GETCURSEL, 0, 0) != mi as isize {
+        SendMessageW(c[16], CB_SETCURSEL, mi, 0);
+    }
+    if SendMessageW(c[17], CB_GETCURSEL, 0, 0) != si as isize {
+        SendMessageW(c[17], CB_SETCURSEL, si, 0);
+    }
 }
 
 unsafe fn draw_item(di: &DRAWITEMSTRUCT) {

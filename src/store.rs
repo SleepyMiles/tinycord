@@ -50,6 +50,11 @@ pub fn load_settings() {
             "overlay" => s.overlay = v.trim().parse().unwrap_or(2).min(4),
             "speakers_only" => s.overlay_speakers_only = v.trim() == "1",
             "guild" => s.selected_guild = v.trim().parse().unwrap_or(0),
+            "mic" => {
+                s.mic_chosen = true;
+                s.mic_device = Some(v.trim().to_string()).filter(|x| !x.is_empty());
+            }
+            "speakers" => s.spk_device = Some(v.trim().to_string()).filter(|x| !x.is_empty()),
             "noise_suppression" => crate::voice::shared()
                 .noise_suppression
                 .store(v.trim() != "0", std::sync::atomic::Ordering::Relaxed),
@@ -74,7 +79,7 @@ pub fn save_settings() {
         crate::voice::shared().vad_db.load(std::sync::atomic::Ordering::Relaxed),
     );
     let text = format!(
-        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n",
+        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\n",
         match s.mode {
             MicMode::Open => "open",
             MicMode::Voice => "voice",
@@ -87,6 +92,8 @@ pub fn save_settings() {
         vad,
         crate::voice::shared().noise_suppression.load(std::sync::atomic::Ordering::Relaxed) as u8,
         crate::voice::shared().auto_gain.load(std::sync::atomic::Ordering::Relaxed) as u8,
+        if s.mic_chosen { format!("mic={}\n", s.mic_device.clone().unwrap_or_default()) } else { String::new() },
+        s.spk_device.clone().unwrap_or_default(),
     );
     drop(s);
     let _ = std::fs::write(dir().join("settings.txt"), text);
