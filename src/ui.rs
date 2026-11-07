@@ -375,6 +375,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_TIMER => {
             if wp == TIMER_REFRESH {
                 capture_key();
+                mic_meter(hwnd);
                 if state::DIRTY.swap(false, Ordering::AcqRel) {
                     refresh();
                 }
@@ -499,6 +500,33 @@ unsafe fn on_command(id: i32, code: u32) {
         }
         _ => {}
     }
+}
+
+/// Shows the mic level in the title bar while in voice (about 4 times a second).
+unsafe fn mic_meter(hwnd: HWND) {
+    use std::sync::atomic::AtomicU32;
+    static TICK: AtomicU32 = AtomicU32::new(0);
+    if TICK.fetch_add(1, Ordering::Relaxed) % 5 != 0 {
+        return;
+    }
+    let (in_voice, talking) = {
+        let s = state();
+        (s.joined.is_some() && s.voice_ready, s.self_talking)
+    };
+    let title = if in_voice {
+        let db = f32::from_bits(crate::voice::shared().mic_level.load(Ordering::Relaxed));
+        let bars = (((db + 60.0) / 6.0).clamp(0.0, 10.0)) as usize;
+        format!(
+            "tinycord  mic {}{} {:.0} dB{}",
+            "\u{2588}".repeat(bars),
+            "\u{2591}".repeat(10 - bars),
+            db.max(-99.0),
+            if talking { "  SENDING" } else { "" }
+        )
+    } else {
+        "tinycord".to_string()
+    };
+    set_text(hwnd, &title);
 }
 
 unsafe fn join_selected() {

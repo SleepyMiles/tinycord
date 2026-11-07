@@ -8,7 +8,21 @@ mod store;
 mod ui;
 mod voice;
 
+fn init_log() {
+    let path = store::dir().join("log.txt");
+    if let Ok(file) = std::fs::File::create(path) {
+        let filter = tracing_subscriber::EnvFilter::new("warn,tinycord=info,songbird=info,davey=info");
+        tracing_subscriber::fmt()
+            .with_writer(std::sync::Mutex::new(file))
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .init();
+    }
+}
+
 fn main() {
+    init_log();
+    tracing::info!("tinycord {} starting", env!("CARGO_PKG_VERSION"));
     store::load_settings();
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();

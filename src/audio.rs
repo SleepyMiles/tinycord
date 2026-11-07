@@ -148,6 +148,7 @@ pub fn start(shared: Arc<Shared>, deafened: Arc<AtomicBool>) -> AudioHandle {
 
 fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> {
     let sup = dev.default_input_config().ok()?;
+    tracing::info!("mic: {:?} {:?}", dev.description().ok(), sup);
     let fmt = sup.sample_format();
     let cfg = sup.config();
     let ch = cfg.channels.max(1) as usize;
@@ -205,6 +206,7 @@ fn build_output(
     deafened: Arc<AtomicBool>,
 ) -> Option<cpal::Stream> {
     let sup = dev.default_output_config().ok()?;
+    tracing::info!("speakers: {:?} {:?}", dev.description().ok(), sup);
     let fmt = sup.sample_format();
     let cfg = sup.config();
     let ch = cfg.channels.max(1) as usize;

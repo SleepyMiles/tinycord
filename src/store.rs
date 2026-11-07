@@ -5,7 +5,7 @@
 use crate::state::{state, MicMode};
 use std::path::PathBuf;
 
-fn dir() -> PathBuf {
+pub fn dir() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))

@@ -6,7 +6,7 @@ use crate::state::{self, state, MicMode};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use songbird::driver::{Bitrate, Channels, DecodeConfig, DecodeMode, MixMode, SampleRate};
-use songbird::events::{CoreEvent, Event, EventContext, EventHandler};
+use songbird::events::{CoreEvent, Event, EventContext, EventHandler, TrackEvent};
 use songbird::input::{AudioStream, Input, LiveInput, RawAdapter};
 use songbird::tracks::{Track, TrackHandle};
 use songbird::{Config, ConnectionInfo, Driver};
@@ -65,7 +65,12 @@ pub async fn connect(cur: &mut Option<Voice>, info: ConnectionInfo) -> Result<()
         driver.add_global_event(Event::Core(ev), rx.clone());
     }
 
-    driver.connect(info).await.map_err(|e| e.to_string())?;
+    tracing::info!("connecting voice");
+    driver.connect(info).await.map_err(|e| {
+        tracing::warn!("voice connect failed: {e}");
+        e.to_string()
+    })?;
+    tracing::info!("voice connected");
 
     let audio = audio::start(shared().clone(), deaf_flag().clone());
     let src = RawAdapter::new(MicSource::new(shared().clone()), audio::RATE as u32, 1);
@@ -74,6 +79,9 @@ pub async fn connect(cur: &mut Option<Voice>, info: ConnectionInfo) -> Result<()
         None,
     );
     let handle = driver.play(Track::new(input).pause());
+    for ev in [TrackEvent::Error, TrackEvent::Playable, TrackEvent::End] {
+        let _ = handle.add_event(Event::Track(ev), MicTrackWatch);
+    }
     *TRACK.lock() = Some(handle);
 
     *cur = Some(Voice { driver, _audio: audio });
@@ -97,6 +105,24 @@ pub fn disconnect(cur: &mut Option<Voice>) {
 pub fn set_known_users(ids: Vec<u64>) {
     if let Ok(mut w) = songbird::EXTRA_RECOGNIZED_USERS.write() {
         *w = ids;
+    }
+}
+
+/// Reports what happens to our mic track (so a silent failure shows up).
+struct MicTrackWatch;
+
+#[async_trait]
+impl EventHandler for MicTrackWatch {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        if let EventContext::Track(list) = ctx {
+            for (st, _) in list.iter() {
+                tracing::info!("mic track: {:?}", st.playing);
+                if let songbird::tracks::PlayMode::Errored(e) = &st.playing {
+                    state::set_status(format!("Mic error: {e}"));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -221,11 +247,15 @@ pub fn transmit_loop(key_down: fn(u32) -> bool) {
             };
         if want != sending {
             if let Some(h) = TRACK.lock().as_ref() {
-                if want {
+                let r = if want {
                     sh.trim_mic_preroll();
-                    let _ = h.play();
+                    h.play()
                 } else {
-                    let _ = h.pause();
+                    h.pause()
+                };
+                if let Err(e) = r {
+                    tracing::warn!("mic track control failed: {e:?}");
+                    state::set_status("Mic stopped working - rejoin the channel");
                 }
             }
             sending = want;
