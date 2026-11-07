@@ -176,9 +176,22 @@ struct MicProcessor {
     pending: Vec<f32>,
     frame_in: [f32; DenoiseState::FRAME_SIZE],
     frame_out: [f32; DenoiseState::FRAME_SIZE],
+    /// Auto-gain multiplier (changes slowly, per 10 ms frame).
     gain: f32,
+    /// Gain actually applied at the end of the last frame; the next frame
+    /// glides from here, so gain never jumps between samples.
+    applied: f32,
+    /// Smoothed speech power that auto gain reacts to (~70 ms memory).
+    speech_pow: f32,
+    /// Look-ahead limiter: samples waiting 2 ms, and how far each one would
+    /// need turning down to stay under the ceiling.
+    delay: VecDeque<(f32, f32)>,
     limit: f32,
 }
+
+/// Limiter look-ahead (2 ms) and ceiling.
+const LOOKAHEAD: usize = 2 * MS;
+const CEILING: f32 = 0.9;
 
 impl MicProcessor {
     fn new() -> Self {
@@ -188,14 +201,17 @@ impl MicProcessor {
             frame_in: [0.0; DenoiseState::FRAME_SIZE],
             frame_out: [0.0; DenoiseState::FRAME_SIZE],
             gain: 1.0,
+            applied: 1.0,
+            speech_pow: 0.0,
+            delay: VecDeque::with_capacity(LOOKAHEAD + 1),
             limit: 1.0,
         }
     }
 
     fn run(&mut self, input: &[f32], out: &mut VecDeque<f32>, shared: &Shared) {
         const N: usize = DenoiseState::FRAME_SIZE;
-        // Speaking level auto gain aims for (-16.5 dBFS RMS, loud but with
-        // room for peaks), and its gain limits (up to +24 dB).
+        // Auto gain aims for a speaking level of -16.5 dBFS RMS (loud, with
+        // room for peaks), boosting up to +24 dB.
         const TARGET_RMS: f32 = 0.15;
         const MIN_GAIN: f32 = 0.5;
         const MAX_GAIN: f32 = 16.0;
@@ -204,6 +220,7 @@ impl MicProcessor {
         let ns_on = shared.noise_suppression.load(Ordering::Relaxed);
         let agc_on = shared.auto_gain.load(Ordering::Relaxed);
         let threshold = f32::from_bits(shared.vad_db.load(Ordering::Relaxed));
+        let volume = f32::from_bits(shared.input_volume.load(Ordering::Relaxed)).clamp(0.0, 2.0);
         let mut start = 0;
         while self.pending.len() - start >= N {
             let chunk = &self.pending[start..start + N];
@@ -224,8 +241,8 @@ impl MicProcessor {
                 *s /= 32768.0;
                 sum += *s * *s;
             }
-            let rms = (sum / N as f32).sqrt();
-            let db = 20.0 * rms.max(1e-9).log10();
+            let pow = sum / N as f32;
+            let db = 10.0 * pow.max(1e-18).log10();
             shared.vad_level.store(db.to_bits(), Ordering::Relaxed);
             let voice = db > threshold && (!ns_on || vad_prob > 0.5);
             if voice {
@@ -233,31 +250,48 @@ impl MicProcessor {
             }
 
             if agc_on {
-                if voice && rms > 1e-4 {
-                    let want = (TARGET_RMS / rms).clamp(MIN_GAIN, MAX_GAIN);
-                    // Turn down quickly, turn up slowly (avoids pumping).
-                    let rate = if want < self.gain { 0.25 } else { 0.05 };
+                if voice {
+                    // React to the speaking level over ~70 ms, not to each
+                    // 10 ms frame (single frames jump around a lot).
+                    if self.speech_pow == 0.0 {
+                        self.speech_pow = pow;
+                    }
+                    self.speech_pow += (pow - self.speech_pow) * 0.15;
+                    let want = (TARGET_RMS / self.speech_pow.sqrt().max(1e-5)).clamp(MIN_GAIN, MAX_GAIN);
+                    // Turn down fairly fast, up slowly (no pumping).
+                    let rate = if want < self.gain { 0.1 } else { 0.02 };
                     self.gain += (want - self.gain) * rate;
                 }
             } else {
                 self.gain = 1.0;
             }
             shared.agc_gain.store(self.gain.to_bits(), Ordering::Relaxed);
-            let volume = f32::from_bits(shared.input_volume.load(Ordering::Relaxed)).clamp(0.0, 2.0);
-            // Peak limiter: if a sample would go over 0.9, turn down at once
-            // and recover over ~50 ms. Avoids the distortion of clipping.
+
+            // Glide from the gain used at the end of the last frame to the
+            // new one across this frame's 480 samples: no steps, no crackle.
+            let from = self.applied;
+            let to = self.gain * volume;
+            self.applied = to;
             let mut sent = 0f32;
-            for s in self.frame_out.iter() {
-                let x = s * self.gain * volume;
-                let need = if x.abs() * self.limit > 0.9 { 0.9 / x.abs() } else { 1.0 };
-                if need < self.limit {
-                    self.limit = need;
+            for (i, s) in self.frame_out.iter().enumerate() {
+                let g = from + (to - from) * (i + 1) as f32 / N as f32;
+                let x = s * g;
+                let need = if x.abs() > CEILING { CEILING / x.abs() } else { 1.0 };
+                self.delay.push_back((x, need));
+                // Look-ahead limiter: start turning down 2 ms before a peak
+                // arrives, smoothly, then recover over ~70 ms.
+                let target = self.delay.iter().fold(1.0f32, |m, d| m.min(d.1));
+                if target < self.limit {
+                    self.limit += (target - self.limit) * 0.06;
                 } else {
-                    self.limit += (1.0 - self.limit) * 0.0005;
+                    self.limit += (1.0 - self.limit) * 0.0003;
                 }
-                let y = soft_limit(x * self.limit);
-                sent += y * y;
-                out.push_back(y);
+                if self.delay.len() > LOOKAHEAD {
+                    let (y, _) = self.delay.pop_front().unwrap();
+                    let y = soft_limit(y * self.limit);
+                    sent += y * y;
+                    out.push_back(y);
+                }
             }
             let sent_db = 10.0 * (sent / N as f32).max(1e-18).log10();
             shared.mic_level.store(sent_db.to_bits(), Ordering::Relaxed);
@@ -435,6 +469,64 @@ pub fn start(
     AudioHandle { stop: tx }
 }
 
+/// Stereo -> mono. Many headsets and virtual mics send the voice on one
+/// channel and silence on the other; averaging those would halve your
+/// volume, so if one channel stays 20 dB+ quieter we use only the live one.
+struct Downmix {
+    ch: usize,
+    pow: Vec<f32>,
+    /// None = average all channels; Some(i) = use channel i only.
+    pick: Option<usize>,
+    /// 0..1 crossfade from average to `pick` (so switching doesn't click).
+    mix: f32,
+    logged: bool,
+}
+
+impl Downmix {
+    fn new(ch: usize) -> Self {
+        Self { ch, pow: vec![0.0; ch], pick: None, mix: 0.0, logged: false }
+    }
+
+    fn run(&mut self, data: &[f32], mono: &mut Vec<f32>) {
+        mono.clear();
+        let ch = self.ch;
+        if ch == 1 {
+            mono.extend_from_slice(data);
+            return;
+        }
+        let frames = (data.len() / ch).max(1);
+        for c in 0..ch {
+            let p = data.iter().skip(c).step_by(ch).map(|x| x * x).sum::<f32>() / frames as f32;
+            self.pow[c] += (p - self.pow[c]) * 0.05;
+        }
+        let (loud, lp) = self
+            .pow
+            .iter()
+            .enumerate()
+            .fold((0, 0f32), |m, (i, p)| if *p > m.1 { (i, *p) } else { m });
+        let others_quiet = self.pow.iter().enumerate().all(|(i, p)| i == loud || *p < lp * 0.01);
+        if lp > 1e-7 {
+            self.pick = if others_quiet { Some(loud) } else { None };
+            if !self.logged && self.pick.is_some() {
+                tracing::info!("mic: only channel {loud} has sound; using it alone");
+                self.logged = true;
+            }
+        }
+        let target = if self.pick.is_some() { 1.0 } else { 0.0 };
+        let step = 1.0 / 4800.0; // 100 ms crossfade
+        for frame in data.chunks(ch) {
+            if self.mix < target {
+                self.mix = (self.mix + step).min(1.0);
+            } else if self.mix > target {
+                self.mix = (self.mix - step).max(0.0);
+            }
+            let avg = frame.iter().sum::<f32>() / ch as f32;
+            let one = frame[self.pick.unwrap_or(0).min(frame.len() - 1)];
+            mono.push(avg * (1.0 - self.mix) + one * self.mix);
+        }
+    }
+}
+
 fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> {
     let sup = dev.default_input_config().ok()?;
     tracing::info!("mic: {:?} {:?}", dev.description().ok(), sup);
@@ -446,11 +538,9 @@ fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> 
     let mut mono: Vec<f32> = Vec::new();
     let mut at48: Vec<f32> = Vec::new();
     let mut proc = MicProcessor::new();
+    let mut downmix = Downmix::new(ch);
     let mut handle = move |data: &[f32]| {
-        mono.clear();
-        for frame in data.chunks(ch) {
-            mono.push(frame.iter().sum::<f32>() / ch as f32);
-        }
+        downmix.run(data, &mut mono);
         let backlog = shared.mic.lock().len();
         rs.step = if backlog > MIC_CATCHUP { base_step * 1.005 } else { base_step };
         at48.clear();
@@ -719,6 +809,52 @@ mod tests {
         println!("send: max jump {max_jump:.4} (smooth tone: 0.013), short reads {short_while_talking}, faded to silence at the end");
         assert!(max_jump < 0.03, "click in sent audio");
         assert_eq!(short_while_talking, 0);
+    }
+
+    /// A voice getting louder and softer (like syllables) through auto gain
+    /// and the limiter. The output must stay smooth: no steps in the
+    /// waveform, which is what crackles like a loose jack.
+    #[test]
+    fn auto_gain_has_no_crackle() {
+        let sh = Shared::new();
+        sh.noise_suppression.store(false, Ordering::Relaxed);
+        sh.input_volume.store(1.5f32.to_bits(), Ordering::Relaxed);
+        let mut p = MicProcessor::new();
+        let input: Vec<f32> = (0..RATE * 4)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                let env = 0.02 + 0.3 * (0.5 + 0.5 * (t * 4.0 * 6.283).sin()).powi(2);
+                env * (t * 180.0 * 6.283).sin()
+            })
+            .collect();
+        let mut out = VecDeque::new();
+        p.run(&input, &mut out, &sh);
+        let out: Vec<f32> = out.into_iter().collect();
+        let body = &out[RATE..];
+        // Steps show up as spikes in the 2nd difference; a clean 180 Hz
+        // tone at full scale has at most (2*pi*180/48000)^2 = 0.00055.
+        let worst = body.windows(3).map(|w| (w[2] - 2.0 * w[1] + w[0]).abs()).fold(0f32, f32::max);
+        let peak = body.iter().fold(0f32, |m, x| m.max(x.abs()));
+        println!("agc: worst 2nd difference {worst:.5} (clean: <0.0006), peak {peak:.3}, gain {:.2}", p.gain);
+        assert!(worst < 0.002, "crackle: waveform has steps");
+        assert!(peak <= 1.0);
+    }
+
+    #[test]
+    fn one_sided_stereo_is_not_halved() {
+        let mut d = Downmix::new(2);
+        let mut mono = Vec::new();
+        let mut last = Vec::new();
+        for k in 0..100 {
+            let data: Vec<f32> = (0..480)
+                .flat_map(|i| [((k * 480 + i) as f32 * 0.03).sin() * 0.5, 0.0])
+                .collect();
+            d.run(&data, &mut mono);
+            last = mono.clone();
+        }
+        let peak = last.iter().fold(0f32, |m, x| m.max(x.abs()));
+        println!("downmix: one-sided stereo peak {peak:.3} (input 0.5)");
+        assert!(peak > 0.45);
     }
 
     #[test]
