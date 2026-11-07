@@ -10,6 +10,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use nnnoiseless::DenoiseState;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,6 +35,10 @@ pub struct Shared {
     pub epoch: Instant,
     /// Voice activity threshold in dBFS (stored as f32 bits).
     pub vad_db: AtomicU32,
+    /// RNNoise noise suppression on/off.
+    pub noise_suppression: AtomicBool,
+    /// Automatic gain control on/off.
+    pub auto_gain: AtomicBool,
 }
 
 impl Shared {
@@ -45,6 +50,8 @@ impl Shared {
             last_voice_ms: AtomicU64::new(0),
             epoch: Instant::now(),
             vad_db: AtomicU32::new((-45.0f32).to_bits()),
+            noise_suppression: AtomicBool::new(true),
+            auto_gain: AtomicBool::new(true),
         })
     }
 
@@ -109,6 +116,98 @@ impl Resampler {
     }
 }
 
+/// Mic clean-up, run in 10 ms frames at 48 kHz:
+/// 1. RNNoise noise suppression (also gives a "is this a voice?" score),
+/// 2. voice activity detection,
+/// 3. automatic gain toward a steady speaking level, with a soft limiter.
+struct MicProcessor {
+    ns: Box<DenoiseState<'static>>,
+    pending: Vec<f32>,
+    frame_in: [f32; DenoiseState::FRAME_SIZE],
+    frame_out: [f32; DenoiseState::FRAME_SIZE],
+    gain: f32,
+}
+
+impl MicProcessor {
+    fn new() -> Self {
+        Self {
+            ns: DenoiseState::new(),
+            pending: Vec::with_capacity(4 * DenoiseState::FRAME_SIZE),
+            frame_in: [0.0; DenoiseState::FRAME_SIZE],
+            frame_out: [0.0; DenoiseState::FRAME_SIZE],
+            gain: 1.0,
+        }
+    }
+
+    fn run(&mut self, input: &[f32], out: &mut VecDeque<f32>, shared: &Shared) {
+        const N: usize = DenoiseState::FRAME_SIZE;
+        // Speaking level AGC aims for (-18 dBFS RMS), and its gain limits.
+        const TARGET_RMS: f32 = 0.126;
+        const MIN_GAIN: f32 = 0.5;
+        const MAX_GAIN: f32 = 8.0;
+
+        self.pending.extend_from_slice(input);
+        let ns_on = shared.noise_suppression.load(Ordering::Relaxed);
+        let agc_on = shared.auto_gain.load(Ordering::Relaxed);
+        let threshold = f32::from_bits(shared.vad_db.load(Ordering::Relaxed));
+        let mut start = 0;
+        while self.pending.len() - start >= N {
+            let chunk = &self.pending[start..start + N];
+            start += N;
+            // RNNoise works on 16-bit-scale floats.
+            for (d, s) in self.frame_in.iter_mut().zip(chunk) {
+                *d = s * 32768.0;
+            }
+            let vad_prob = if ns_on {
+                self.ns.process_frame(&mut self.frame_out, &self.frame_in)
+            } else {
+                self.frame_out.copy_from_slice(&self.frame_in);
+                1.0
+            };
+
+            let mut sum = 0f32;
+            for s in self.frame_out.iter_mut() {
+                *s /= 32768.0;
+                sum += *s * *s;
+            }
+            let rms = (sum / N as f32).sqrt();
+            let db = 20.0 * rms.max(1e-9).log10();
+            shared.mic_level.store(db.to_bits(), Ordering::Relaxed);
+            let voice = db > threshold && (!ns_on || vad_prob > 0.5);
+            if voice {
+                shared.last_voice_ms.store(shared.now_ms(), Ordering::Relaxed);
+            }
+
+            if agc_on {
+                if voice && rms > 1e-4 {
+                    let want = (TARGET_RMS / rms).clamp(MIN_GAIN, MAX_GAIN);
+                    // Turn down quickly, turn up slowly (avoids pumping).
+                    let rate = if want < self.gain { 0.25 } else { 0.03 };
+                    self.gain += (want - self.gain) * rate;
+                }
+            } else {
+                self.gain = 1.0;
+            }
+            for s in self.frame_out.iter() {
+                out.push_back(soft_limit(s * self.gain));
+            }
+        }
+        self.pending.drain(..start);
+    }
+}
+
+/// Leaves normal levels alone and bends peaks above 0.8 smoothly toward 1.0
+/// instead of hard clipping.
+fn soft_limit(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= 0.8 {
+        x
+    } else {
+        let over = a - 0.8;
+        x.signum() * (0.8 + 0.2 * over / (over + 0.2))
+    }
+}
+
 pub struct AudioHandle {
     stop: mpsc::Sender<()>,
 }
@@ -154,22 +253,17 @@ fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> 
     let ch = cfg.channels.max(1) as usize;
     let mut rs = Resampler::new(cfg.sample_rate, RATE as u32);
     let mut mono: Vec<f32> = Vec::new();
+    let mut at48: Vec<f32> = Vec::new();
+    let mut proc = MicProcessor::new();
     let mut handle = move |data: &[f32]| {
         mono.clear();
-        let mut sum = 0f32;
         for frame in data.chunks(ch) {
-            let s = frame.iter().sum::<f32>() / ch as f32;
-            sum += s * s;
-            mono.push(s);
+            mono.push(frame.iter().sum::<f32>() / ch as f32);
         }
-        let rms = (sum / mono.len().max(1) as f32).sqrt();
-        let db = 20.0 * rms.max(1e-9).log10();
-        shared.mic_level.store(db.to_bits(), Ordering::Relaxed);
-        if db > f32::from_bits(shared.vad_db.load(Ordering::Relaxed)) {
-            shared.last_voice_ms.store(shared.now_ms(), Ordering::Relaxed);
-        }
+        at48.clear();
+        rs.run(&mono, &mut at48);
         let mut m = shared.mic.lock();
-        rs.run(&mono, &mut *m);
+        proc.run(&at48, &mut m, &shared);
         if m.len() > MIC_MAX {
             let drop = m.len() - MIC_MAX;
             m.drain(..drop);
@@ -320,5 +414,74 @@ impl songbird::input::core::io::MediaSource for MicSource {
     }
     fn byte_len(&self) -> Option<u64> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rms(v: &[f32]) -> f32 {
+        (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    fn noise(n: usize, amp: f32) -> Vec<f32> {
+        let mut x: u32 = 12345;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (x as f32 / u32::MAX as f32 * 2.0 - 1.0) * amp
+            })
+            .collect()
+    }
+
+    #[test]
+    fn noise_is_suppressed() {
+        let sh = Shared::new();
+        sh.auto_gain.store(false, Ordering::Relaxed);
+        let mut p = MicProcessor::new();
+        let input = noise(RATE * 2, 0.05);
+        let mut out = VecDeque::new();
+        let t = Instant::now();
+        p.run(&input, &mut out, &sh);
+        let took = t.elapsed();
+        let out: Vec<f32> = out.into_iter().collect();
+        let tail = &out[RATE..];
+        println!("noise rms in {:.4} out {:.4}; 2 s processed in {:?}", rms(&input[RATE..]), rms(tail), took);
+        assert!(rms(tail) < rms(&input[RATE..]) * 0.75);
+    }
+
+    #[test]
+    fn quiet_voice_is_boosted() {
+        let sh = Shared::new();
+        sh.noise_suppression.store(false, Ordering::Relaxed);
+        let mut p = MicProcessor::new();
+        // A quiet "voice": 150 Hz tone with harmonics around -38 dBFS.
+        let input: Vec<f32> = (0..RATE * 3)
+            .map(|i| {
+                let t = i as f32 / RATE as f32;
+                0.008 * ((t * 150.0 * 6.283).sin() + 0.5 * (t * 300.0 * 6.283).sin())
+            })
+            .collect();
+        let mut out = VecDeque::new();
+        p.run(&input, &mut out, &sh);
+        let out: Vec<f32> = out.into_iter().collect();
+        println!("quiet rms in {:.4} out {:.4} gain {:.2}", rms(&input[RATE * 2..]), rms(&out[RATE * 2..]), p.gain);
+        assert!(p.gain > 3.0);
+    }
+
+    #[test]
+    fn loud_voice_is_not_clipped() {
+        let sh = Shared::new();
+        sh.noise_suppression.store(false, Ordering::Relaxed);
+        let mut p = MicProcessor::new();
+        let input: Vec<f32> = (0..RATE * 2).map(|i| 0.99 * (i as f32 / RATE as f32 * 200.0 * 6.283).sin()).collect();
+        let mut out = VecDeque::new();
+        p.run(&input, &mut out, &sh);
+        let peak = out.iter().fold(0f32, |m, x| m.max(x.abs()));
+        println!("loud peak out {peak:.3} gain {:.2}", p.gain);
+        assert!(peak <= 1.0 && p.gain < 1.0);
     }
 }

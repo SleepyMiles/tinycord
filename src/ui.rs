@@ -32,6 +32,8 @@ const ID_SENS: i32 = 110;
 const ID_OVERLAY: i32 = 111;
 const ID_SPK: i32 = 112;
 const ID_TOP: i32 = 113;
+const ID_NS: i32 = 114;
+const ID_AGC: i32 = 115;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_TOPMOST: usize = 2;
@@ -66,7 +68,7 @@ struct Row {
 struct Ui {
     hwnd: HWND,
     overlay: HWND,
-    c: [HWND; 14],
+    c: [HWND; 16],
     font: HFONT,
     bold: HFONT,
     ofont: HFONT,
@@ -195,7 +197,7 @@ pub fn run() {
             *u.borrow_mut() = Some(Ui {
                 hwnd: null_mut(),
                 overlay: null_mut(),
-                c: [null_mut(); 14],
+                c: [null_mut(); 16],
                 font: make_font(dpi, 9, FW_NORMAL as i32),
                 bold: make_font(dpi, 9, FW_BOLD as i32),
                 ofont: make_font(dpi, 11, FW_SEMIBOLD as i32),
@@ -210,7 +212,7 @@ pub fn run() {
         });
 
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut r = RECT { left: 0, top: 0, right: sc(dpi, 280), bottom: sc(dpi, 434) };
+        let mut r = RECT { left: 0, top: 0, right: sc(dpi, 280), bottom: sc(dpi, 458) };
         AdjustWindowRect(&mut r, style, 0);
         let title = wide("tinycord");
         let hwnd = CreateWindowExW(
@@ -309,7 +311,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let cbo = |x, y, w, id| {
         child(hwnd, "COMBOBOX", "", ts | WS_VSCROLL | CBS_DROPDOWNLIST as u32, x, y, w, 300, id, dpi, font)
     };
-    let mut c = [null_mut(); 14];
+    let mut c = [null_mut(); 16];
     c[0] = child(hwnd, "STATIC", "Starting...", SS_LEFT as u32 | SS_ENDELLIPSIS as u32, 6, 6, 268, 18, ID_STATUS, dpi, font);
     c[1] = child(hwnd, "EDIT", "", ts | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32, 6, 28, 190, 24, ID_TOKEN, dpi, font);
     c[2] = b("Log in", BS_PUSHBUTTON, 202, 28, 72, 24, ID_LOGIN);
@@ -336,6 +338,8 @@ unsafe fn create_controls(hwnd: HWND) {
     c[11] = cbo(142, 376, 132, ID_OVERLAY);
     c[12] = b("Speakers only", BS_AUTOCHECKBOX, 8, 406, 128, 22, ID_SPK);
     c[13] = b("Keep on top", BS_AUTOCHECKBOX, 144, 406, 128, 22, ID_TOP);
+    c[14] = b("Noise suppression", BS_AUTOCHECKBOX, 8, 430, 128, 22, ID_NS);
+    c[15] = b("Auto gain", BS_AUTOCHECKBOX, 144, 430, 128, 22, ID_AGC);
 
     combo_add(c[8], &["Voice activation", "Push-to-talk", "Open mic"]);
     combo_add(c[10], &SENS.map(|s| s.0));
@@ -351,7 +355,10 @@ unsafe fn create_controls(hwnd: HWND) {
     SendMessageW(c[11], CB_SETCURSEL, s.overlay as usize, 0);
     SendMessageW(c[12], BM_SETCHECK, s.overlay_speakers_only as usize, 0);
     drop(s);
-    let vad = f32::from_bits(crate::voice::shared().vad_db.load(Ordering::Relaxed));
+    let sh = crate::voice::shared();
+    SendMessageW(c[14], BM_SETCHECK, sh.noise_suppression.load(Ordering::Relaxed) as usize, 0);
+    SendMessageW(c[15], BM_SETCHECK, sh.auto_gain.load(Ordering::Relaxed) as usize, 0);
+    let vad = f32::from_bits(sh.vad_db.load(Ordering::Relaxed));
     let sens_idx = SENS
         .iter()
         .enumerate()
@@ -487,6 +494,16 @@ unsafe fn on_command(id: i32, code: u32) {
             state().overlay_speakers_only = SendMessageW(c[12], BM_GETCHECK, 0, 0) == 1;
             store::save_settings();
             state::changed();
+        }
+        (ID_NS, BN_CLICKED) => {
+            let on = SendMessageW(c[14], BM_GETCHECK, 0, 0) == 1;
+            crate::voice::shared().noise_suppression.store(on, Ordering::Relaxed);
+            store::save_settings();
+        }
+        (ID_AGC, BN_CLICKED) => {
+            let on = SendMessageW(c[15], BM_GETCHECK, 0, 0) == 1;
+            crate::voice::shared().auto_gain.store(on, Ordering::Relaxed);
+            store::save_settings();
         }
         (ID_TOP, BN_CLICKED) => {
             let on = SendMessageW(c[13], BM_GETCHECK, 0, 0) == 1;
