@@ -18,8 +18,12 @@ use std::time::{Duration, Instant};
 pub const RATE: usize = 48_000;
 const MS: usize = RATE / 1000;
 
-/// Max audio waiting to be sent (anything older is dropped).
-const MIC_MAX: usize = 60 * MS;
+/// Max audio waiting to be sent (anything older is dropped, with a crossfade).
+const MIC_MAX: usize = 80 * MS;
+/// Above this much mic backlog, the capture side runs 0.5% "faster".
+const MIC_CATCHUP: usize = 45 * MS;
+/// Cushion kept when sending (re)starts, so reads never come up short.
+const MIC_PREROLL: usize = 30 * MS;
 /// Max audio waiting to be played before we skip ahead (with a crossfade).
 const OUT_MAX: usize = 150 * MS;
 /// What we skip ahead to when OUT_MAX is exceeded.
@@ -70,9 +74,9 @@ impl Shared {
     /// first syllable isn't cut when voice activation / push-to-talk opens.
     pub fn trim_mic_preroll(&self) {
         let mut m = self.mic.lock();
-        let keep = 20 * MS;
-        while m.len() > keep {
-            m.pop_front();
+        if m.len() > MIC_PREROLL {
+            let drop = m.len() - MIC_PREROLL;
+            m.drain(..drop);
         }
     }
 
@@ -80,17 +84,23 @@ impl Shared {
     pub fn push_out(&self, pcm: &[i16]) {
         let mut o = self.out.lock();
         o.extend(pcm.iter().map(|s| *s as f32 / 32768.0));
-        if o.len() > OUT_MAX {
-            // Skip ahead, blending 2 ms of old into new so there's no click.
-            const XF: usize = 2 * MS;
-            let old: Vec<f32> = o.iter().take(XF).copied().collect();
-            let drop = o.len() - OUT_TARGET;
-            o.drain(..drop);
-            for (i, (n, a)) in o.iter_mut().zip(old.iter()).enumerate() {
-                let t = (i + 1) as f32 / (XF + 1) as f32;
-                *n = *a * (1.0 - t) + *n * t;
-            }
-        }
+        trim_with_crossfade(&mut o, OUT_MAX, OUT_TARGET);
+    }
+}
+
+/// If `q` holds more than `max`, cut it down to `target`, blending 2 ms of the
+/// old start into the new start so the cut doesn't click.
+fn trim_with_crossfade(q: &mut VecDeque<f32>, max: usize, target: usize) {
+    if q.len() <= max {
+        return;
+    }
+    const XF: usize = 2 * MS;
+    let old: Vec<f32> = q.iter().take(XF).copied().collect();
+    let drop = q.len() - target;
+    q.drain(..drop);
+    for (i, (n, a)) in q.iter_mut().zip(old.iter()).enumerate() {
+        let t = (i + 1) as f32 / (XF + 1) as f32;
+        *n = *a * (1.0 - t) + *n * t;
     }
 }
 
@@ -171,9 +181,9 @@ impl MicProcessor {
 
     fn run(&mut self, input: &[f32], out: &mut VecDeque<f32>, shared: &Shared) {
         const N: usize = DenoiseState::FRAME_SIZE;
-        // Speaking level auto gain aims for (-15 dBFS RMS, a loud, clear
-        // voice), and its gain limits (up to +24 dB).
-        const TARGET_RMS: f32 = 0.178;
+        // Speaking level auto gain aims for (-16.5 dBFS RMS, loud but with
+        // room for peaks), and its gain limits (up to +24 dB).
+        const TARGET_RMS: f32 = 0.15;
         const MIN_GAIN: f32 = 0.5;
         const MAX_GAIN: f32 = 16.0;
 
@@ -241,15 +251,15 @@ impl MicProcessor {
     }
 }
 
-/// Leaves normal levels alone and bends peaks above 0.8 smoothly toward 1.0
-/// instead of hard clipping.
+/// Last-resort safety: leaves everything up to 0.92 untouched (the limiter
+/// keeps peaks at 0.9) and bends anything above smoothly toward 1.0.
 fn soft_limit(x: f32) -> f32 {
     let a = x.abs();
-    if a <= 0.8 {
+    if a <= 0.92 {
         x
     } else {
-        let over = a - 0.8;
-        x.signum() * (0.8 + 0.2 * over / (over + 0.2))
+        let over = a - 0.92;
+        x.signum() * (0.92 + 0.08 * over / (over + 0.08))
     }
 }
 
@@ -417,6 +427,7 @@ fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> 
     let cfg = sup.config();
     let ch = cfg.channels.max(1) as usize;
     let mut rs = Resampler::new(cfg.sample_rate, RATE as u32);
+    let base_step = rs.step;
     let mut mono: Vec<f32> = Vec::new();
     let mut at48: Vec<f32> = Vec::new();
     let mut proc = MicProcessor::new();
@@ -425,14 +436,13 @@ fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> 
         for frame in data.chunks(ch) {
             mono.push(frame.iter().sum::<f32>() / ch as f32);
         }
+        let backlog = shared.mic.lock().len();
+        rs.step = if backlog > MIC_CATCHUP { base_step * 1.005 } else { base_step };
         at48.clear();
         rs.run(&mono, &mut at48);
         let mut m = shared.mic.lock();
         proc.run(&at48, &mut m, &shared);
-        if m.len() > MIC_MAX {
-            let drop = m.len() - MIC_MAX;
-            m.drain(..drop);
-        }
+        trim_with_crossfade(&mut m, MIC_MAX, MIC_PREROLL);
     };
     let err = |e| eprintln!("mic error: {e}");
     let stream = match fmt {
@@ -507,34 +517,39 @@ fn build_output(
 pub struct MicSource {
     pub shared: Arc<Shared>,
     pending: Vec<u8>,
+    last: f32,
+    short_reads: u64,
 }
 
 impl MicSource {
     pub fn new(shared: Arc<Shared>) -> Self {
-        Self { shared, pending: Vec::new() }
+        Self { shared, pending: Vec::new(), last: 0.0, short_reads: 0 }
     }
 }
 
 impl std::io::Read for MicSource {
+    /// Called by the voice engine once per 20 ms packet. Never waits: if the
+    /// mic is a little behind, the gap is filled by letting the last sample
+    /// fade out (no hard silence, which is what made a "pop").
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pending.is_empty() {
             let want = (buf.len() / 4).clamp(1, 20 * MS);
-            // Give the mic up to ~15 ms to catch up before padding.
-            let deadline = Instant::now() + Duration::from_millis(15);
-            loop {
-                if self.shared.mic.lock().len() >= want || Instant::now() >= deadline {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
             let mut m = self.shared.mic.lock();
             let n = want.min(m.len());
             for s in m.drain(..n) {
+                self.last = s;
                 self.pending.extend_from_slice(&s.to_le_bytes());
             }
             drop(m);
-            for _ in n..want {
-                self.pending.extend_from_slice(&0f32.to_le_bytes());
+            if n < want {
+                self.short_reads += 1;
+                if self.short_reads % 50 == 1 {
+                    tracing::info!("mic short read #{} ({} of {} samples)", self.short_reads, n, want);
+                }
+                for _ in n..want {
+                    self.last *= 0.99;
+                    self.pending.extend_from_slice(&self.last.to_le_bytes());
+                }
             }
         }
         let n = buf.len().min(self.pending.len());
@@ -596,7 +611,8 @@ mod tests {
                 sent += 960;
                 sh.push_out(&pcm);
                 rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-                next_push += 20 + (rng % 17) as i64 - 8;
+                // Ticks are on a steady 20 ms clock; jitter doesn't add up.
+                next_push = (sent / 960) as i64 * 20 + (rng % 17) as i64 - 8;
             }
             if ms % 10 == 0 {
                 let mut buf = vec![0f32; 480];
@@ -611,6 +627,55 @@ mod tests {
         println!("max jump {max_jump:.4} (a smooth tone moves at most 0.013), silent 5ms gaps {silent_gaps}, backlog {} ms", sh.out.lock().len() / MS);
         assert!(max_jump < 0.03, "click detected");
         assert_eq!(silent_gaps, 0);
+    }
+
+    /// Mic delivers 10 ms chunks with up to 4 ms of jitter; the voice engine
+    /// reads 20 ms every 20 ms. What we send must have no clicks or gaps.
+    #[test]
+    fn sending_has_no_clicks() {
+        use std::io::Read;
+        let sh = Shared::new();
+        sh.noise_suppression.store(false, Ordering::Relaxed);
+        sh.auto_gain.store(false, Ordering::Relaxed);
+        let mut proc = MicProcessor::new();
+        let mut src = MicSource::new(sh.clone());
+        let tone = |n: usize| ((n as f32) * 200.0 * 6.283 / 48_000.0).sin() * 0.5;
+        let mut made = 0usize;
+        let mut sent: Vec<f32> = Vec::new();
+        let mut next_cap = 0i64;
+        let mut rng: u32 = 99;
+        let mut started = false;
+        for ms in 0..5000i64 {
+            if ms >= next_cap {
+                let chunk: Vec<f32> = (made..made + 480).map(tone).collect();
+                made += 480;
+                let mut m = sh.mic.lock();
+                proc.run(&chunk, &mut m, &sh);
+                trim_with_crossfade(&mut m, MIC_MAX, MIC_PREROLL);
+                drop(m);
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                // The sound card's clock is steady: jitter doesn't add up.
+                next_cap = (made / 480) as i64 * 10 + (rng % 9) as i64 - 4;
+            }
+            if ms == 200 {
+                sh.trim_mic_preroll(); // "start sending"
+                started = true;
+            }
+            if started && ms % 20 == 0 {
+                let mut buf = vec![0u8; 3840];
+                let mut got = 0;
+                while got < buf.len() {
+                    got += src.read(&mut buf[got..]).unwrap();
+                }
+                sent.extend(buf.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+            }
+        }
+        let body = &sent[960..];
+        let max_jump = body.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        println!("send: max jump {max_jump:.4} (smooth tone: 0.013), short reads {}, backlog {} ms",
+            src.short_reads, sh.mic.lock().len() / MS);
+        assert!(max_jump < 0.03, "click in sent audio");
+        assert_eq!(src.short_reads, 0);
     }
 
     #[test]

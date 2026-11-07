@@ -345,6 +345,7 @@ fn parse_guild(g: &Value) -> Option<Guild> {
                     id: id(&c["id"]),
                     name: c["name"].as_str().unwrap_or("?").to_string(),
                     position: c["position"].as_i64().unwrap_or(0),
+                    bitrate: c["bitrate"].as_u64().unwrap_or(64_000) as u32,
                 })
                 .collect()
         })
@@ -478,6 +479,7 @@ async fn dispatch(
                         id: cid,
                         name: d["name"].as_str().unwrap_or("?").to_string(),
                         position: d["position"].as_i64().unwrap_or(0),
+                        bitrate: d["bitrate"].as_u64().unwrap_or(64_000) as u32,
                     });
                     g.voice.sort_by_key(|c| c.position);
                 }
@@ -564,8 +566,17 @@ async fn try_voice(pend: &mut Pending, v: &mut Option<voice::Voice>) {
         token: tok,
         user_id: UserId::from(me),
     };
+    let bitrate = {
+        let s = state();
+        s.guilds
+            .iter()
+            .find(|g| g.id == pend.guild)
+            .and_then(|g| g.voice.iter().find(|c| c.id == pend.channel))
+            .map(|c| c.bitrate)
+            .unwrap_or(64_000)
+    };
     state::set_status("Connecting voice...");
-    match voice::connect(v, info).await {
+    match voice::connect(v, info, bitrate).await {
         Ok(()) => {
             pend.connected_with = Some(key);
             let mut s = state();

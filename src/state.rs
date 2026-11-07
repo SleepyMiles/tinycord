@@ -11,6 +11,8 @@ pub struct Chan {
     pub id: u64,
     pub name: String,
     pub position: i64,
+    /// Channel bitrate in bits/s set by the server (Discord default 64000).
+    pub bitrate: u32,
 }
 
 #[derive(Clone, Debug)]

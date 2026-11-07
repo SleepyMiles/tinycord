@@ -89,8 +89,13 @@ pub struct Mixer {
 }
 
 fn new_encoder(bitrate: Bitrate, mix_mode: MixMode) -> Result<OpusEncoder> {
-    let mut encoder = OpusEncoder::new(SAMPLE_RATE, mix_mode.to_opus(), CodingMode::Audio)?;
+    // tinycord patch: tune for speech like a voice-chat client (VoIP mode,
+    // voice signal hint) and add in-band FEC so lost packets are repaired.
+    let mut encoder = OpusEncoder::new(SAMPLE_RATE, mix_mode.to_opus(), CodingMode::Voip)?;
     encoder.set_bitrate(bitrate)?;
+    let _ = encoder.set_signal(opus2::Signal::Voice);
+    let _ = encoder.set_inband_fec(true);
+    let _ = encoder.set_packet_loss_perc(10);
 
     Ok(encoder)
 }

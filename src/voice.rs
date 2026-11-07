@@ -47,13 +47,17 @@ fn driver_config() -> Config {
 }
 
 /// Connect (or reconnect, e.g. after a channel move or server change).
-pub async fn connect(cur: &mut Option<Voice>, info: ConnectionInfo) -> Result<(), String> {
+pub async fn connect(cur: &mut Option<Voice>, info: ConnectionInfo, bitrate: u32) -> Result<(), String> {
+    // Same rule as Discord's own client: encode at the channel's bitrate.
+    let bitrate = Bitrate::Bits(bitrate.clamp(8_000, 384_000) as i32);
+    tracing::info!("channel bitrate {bitrate:?}");
     if let Some(v) = cur.as_mut() {
+        v.driver.set_bitrate(bitrate);
         return v.driver.connect(info).await.map_err(|e| e.to_string());
     }
 
     let mut driver = Driver::new(driver_config());
-    driver.set_bitrate(Bitrate::Bits(64_000));
+    driver.set_bitrate(bitrate);
     let rx = Rx::default();
     for ev in [
         CoreEvent::VoiceTick,
