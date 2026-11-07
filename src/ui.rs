@@ -566,11 +566,13 @@ unsafe fn mic_meter(hwnd: HWND) {
     let title = if in_voice {
         let db = f32::from_bits(crate::voice::shared().mic_level.load(Ordering::Relaxed));
         let bars = (((db + 60.0) / 6.0).clamp(0.0, 10.0)) as usize;
+        let gain = f32::from_bits(crate::voice::shared().agc_gain.load(Ordering::Relaxed));
         format!(
-            "tinycord  mic {}{} {:.0} dB{}",
+            "tinycord  mic {}{} {:.0} dB  x{:.1}{}",
             "\u{2588}".repeat(bars),
             "\u{2591}".repeat(10 - bars),
             db.max(-99.0),
+            gain,
             if talking { "  SENDING" } else { "" }
         )
     } else {

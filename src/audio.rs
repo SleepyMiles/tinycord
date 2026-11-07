@@ -20,10 +20,14 @@ const MS: usize = RATE / 1000;
 
 /// Max audio waiting to be sent (anything older is dropped).
 const MIC_MAX: usize = 60 * MS;
-/// Max audio waiting to be played before we skip ahead.
-const OUT_MAX: usize = 80 * MS;
+/// Max audio waiting to be played before we skip ahead (with a crossfade).
+const OUT_MAX: usize = 150 * MS;
 /// What we skip ahead to when OUT_MAX is exceeded.
-const OUT_TARGET: usize = 30 * MS;
+const OUT_TARGET: usize = 40 * MS;
+/// Audio collected before playback (re)starts, so it never runs dry mid-word.
+const OUT_PREBUF: usize = 30 * MS;
+/// Above this much backlog, play 0.5% faster (inaudible) to catch up.
+const OUT_CATCHUP: usize = 50 * MS;
 
 pub struct Shared {
     pub mic: Mutex<VecDeque<f32>>,
@@ -39,6 +43,8 @@ pub struct Shared {
     pub noise_suppression: AtomicBool,
     /// Automatic gain control on/off.
     pub auto_gain: AtomicBool,
+    /// Current auto-gain multiplier (f32 bits), shown in the title bar.
+    pub agc_gain: AtomicU32,
 }
 
 impl Shared {
@@ -52,6 +58,7 @@ impl Shared {
             vad_db: AtomicU32::new((-45.0f32).to_bits()),
             noise_suppression: AtomicBool::new(true),
             auto_gain: AtomicBool::new(true),
+            agc_gain: AtomicU32::new(1f32.to_bits()),
         })
     }
 
@@ -74,8 +81,15 @@ impl Shared {
         let mut o = self.out.lock();
         o.extend(pcm.iter().map(|s| *s as f32 / 32768.0));
         if o.len() > OUT_MAX {
+            // Skip ahead, blending 2 ms of old into new so there's no click.
+            const XF: usize = 2 * MS;
+            let old: Vec<f32> = o.iter().take(XF).copied().collect();
             let drop = o.len() - OUT_TARGET;
             o.drain(..drop);
+            for (i, (n, a)) in o.iter_mut().zip(old.iter()).enumerate() {
+                let t = (i + 1) as f32 / (XF + 1) as f32;
+                *n = *a * (1.0 - t) + *n * t;
+            }
         }
     }
 }
@@ -94,8 +108,22 @@ impl Resampler {
 
     /// Feed `input`, append converted samples to `out`.
     fn run(&mut self, input: &[f32], out: &mut impl Extend<f32>) {
-        if (self.step - 1.0).abs() < 1e-9 {
-            out.extend(input.iter().copied());
+        if (self.step - 1.0).abs() < 1e-9 && self.pos.fract() == 0.0 {
+            // Same rate and lined up on a sample: copy straight through.
+            // Keep `last`/`pos` correct so switching modes stays seamless.
+            let start = self.pos as usize; // 0 or 1 (1 = `last` is next)
+            if start == 0 {
+                out.extend(std::iter::once(self.last).chain(input[..input.len().saturating_sub(1)].iter().copied()));
+            } else {
+                out.extend(input.iter().copied());
+                self.pos = 1.0;
+            }
+            if let Some(l) = input.last() {
+                self.last = *l;
+            }
+            if start == 0 {
+                self.pos = 0.0;
+            }
             return;
         }
         let mut res = Vec::with_capacity((input.len() as f64 / self.step) as usize + 2);
@@ -126,6 +154,7 @@ struct MicProcessor {
     frame_in: [f32; DenoiseState::FRAME_SIZE],
     frame_out: [f32; DenoiseState::FRAME_SIZE],
     gain: f32,
+    limit: f32,
 }
 
 impl MicProcessor {
@@ -136,15 +165,17 @@ impl MicProcessor {
             frame_in: [0.0; DenoiseState::FRAME_SIZE],
             frame_out: [0.0; DenoiseState::FRAME_SIZE],
             gain: 1.0,
+            limit: 1.0,
         }
     }
 
     fn run(&mut self, input: &[f32], out: &mut VecDeque<f32>, shared: &Shared) {
         const N: usize = DenoiseState::FRAME_SIZE;
-        // Speaking level AGC aims for (-18 dBFS RMS), and its gain limits.
-        const TARGET_RMS: f32 = 0.126;
+        // Speaking level auto gain aims for (-15 dBFS RMS, a loud, clear
+        // voice), and its gain limits (up to +24 dB).
+        const TARGET_RMS: f32 = 0.178;
         const MIN_GAIN: f32 = 0.5;
-        const MAX_GAIN: f32 = 8.0;
+        const MAX_GAIN: f32 = 16.0;
 
         self.pending.extend_from_slice(input);
         let ns_on = shared.noise_suppression.load(Ordering::Relaxed);
@@ -172,7 +203,6 @@ impl MicProcessor {
             }
             let rms = (sum / N as f32).sqrt();
             let db = 20.0 * rms.max(1e-9).log10();
-            shared.mic_level.store(db.to_bits(), Ordering::Relaxed);
             let voice = db > threshold && (!ns_on || vad_prob > 0.5);
             if voice {
                 shared.last_voice_ms.store(shared.now_ms(), Ordering::Relaxed);
@@ -182,15 +212,30 @@ impl MicProcessor {
                 if voice && rms > 1e-4 {
                     let want = (TARGET_RMS / rms).clamp(MIN_GAIN, MAX_GAIN);
                     // Turn down quickly, turn up slowly (avoids pumping).
-                    let rate = if want < self.gain { 0.25 } else { 0.03 };
+                    let rate = if want < self.gain { 0.25 } else { 0.05 };
                     self.gain += (want - self.gain) * rate;
                 }
             } else {
                 self.gain = 1.0;
             }
+            shared.agc_gain.store(self.gain.to_bits(), Ordering::Relaxed);
+            // Peak limiter: if a sample would go over 0.9, turn down at once
+            // and recover over ~50 ms. Avoids the distortion of clipping.
+            let mut sent = 0f32;
             for s in self.frame_out.iter() {
-                out.push_back(soft_limit(s * self.gain));
+                let x = s * self.gain;
+                let need = if x.abs() * self.limit > 0.9 { 0.9 / x.abs() } else { 1.0 };
+                if need < self.limit {
+                    self.limit = need;
+                } else {
+                    self.limit += (1.0 - self.limit) * 0.0005;
+                }
+                let y = soft_limit(x * self.limit);
+                sent += y * y;
+                out.push_back(y);
             }
+            let sent_db = 10.0 * (sent / N as f32).max(1e-18).log10();
+            shared.mic_level.store(sent_db.to_bits(), Ordering::Relaxed);
         }
         self.pending.drain(..start);
     }
@@ -205,6 +250,79 @@ fn soft_limit(x: f32) -> f32 {
     } else {
         let over = a - 0.8;
         x.signum() * (0.8 + 0.2 * over / (over + 0.2))
+    }
+}
+
+/// Turns the 48 kHz voice queue into device audio without clicks: waits for
+/// a small cushion before starting, fades in, lets the sound die away if the
+/// queue runs dry, and plays 0.5% faster when audio piles up.
+struct Playout {
+    rs: Resampler,
+    base_step: f64,
+    conv: VecDeque<f32>,
+    tmp: Vec<f32>,
+    playing: bool,
+    fade: f32,
+    last: f32,
+    fade_step: f32,
+}
+
+impl Playout {
+    fn new(device_rate: u32) -> Self {
+        let rs = Resampler::new(RATE as u32, device_rate);
+        Self {
+            base_step: rs.step,
+            rs,
+            conv: VecDeque::new(),
+            tmp: Vec::new(),
+            playing: false,
+            fade: 0.0,
+            last: 0.0,
+            fade_step: 1.0 / (device_rate as f32 * 0.003),
+        }
+    }
+
+    fn fill(&mut self, out: &mut [f32], ch: usize, shared: &Shared, deaf: bool) {
+        let frames = out.len() / ch;
+        let backlog = shared.out.lock().len();
+        if !self.playing && backlog >= OUT_PREBUF {
+            self.playing = true;
+            self.fade = 0.0;
+        }
+        self.rs.step = if backlog > OUT_CATCHUP { self.base_step * 1.005 } else { self.base_step };
+        while self.playing && self.conv.len() < frames {
+            let need = ((frames - self.conv.len()) as f64 * self.rs.step).ceil() as usize + 1;
+            self.tmp.clear();
+            {
+                let mut o = shared.out.lock();
+                let n = need.min(o.len());
+                self.tmp.extend(o.drain(..n));
+            }
+            if self.tmp.is_empty() {
+                break;
+            }
+            self.rs.run(&self.tmp, &mut self.conv);
+        }
+        for frame in out.chunks_mut(ch) {
+            let next = if self.playing { self.conv.pop_front() } else { None };
+            let s = match next {
+                Some(s) => {
+                    self.fade = (self.fade + self.fade_step).min(1.0);
+                    s * self.fade
+                }
+                None => {
+                    // Ran dry: let the last value die away instead of
+                    // jumping to zero (that jump is the "pop").
+                    self.playing = false;
+                    self.last * 0.97
+                }
+            };
+            self.last = s;
+            let s = if deaf { 0.0 } else { s.clamp(-1.0, 1.0) };
+            for x in frame.iter_mut() {
+                *x = s;
+            }
+        }
     }
 }
 
@@ -351,33 +469,10 @@ fn build_output(
     let fmt = sup.sample_format();
     let cfg = sup.config();
     let ch = cfg.channels.max(1) as usize;
-    let mut rs = Resampler::new(RATE as u32, cfg.sample_rate);
-    let mut conv: VecDeque<f32> = VecDeque::new();
-    let mut tmp: Vec<f32> = Vec::new();
+    let mut playout = Playout::new(cfg.sample_rate);
     let mut fill = move |out: &mut [f32]| {
-        let frames = out.len() / ch;
-        // Pull enough 48k audio to make `frames` device-rate samples.
-        while conv.len() < frames {
-            let need = ((frames - conv.len()) as f64 * rs.step).ceil() as usize + 1;
-            tmp.clear();
-            {
-                let mut o = shared.out.lock();
-                let n = need.min(o.len());
-                tmp.extend(o.drain(..n));
-            }
-            if tmp.is_empty() {
-                break;
-            }
-            rs.run(&tmp, &mut conv);
-        }
         let deaf = deafened.load(Ordering::Relaxed);
-        for frame in out.chunks_mut(ch) {
-            let s = conv.pop_front().unwrap_or(0.0);
-            let s = if deaf { 0.0 } else { s.clamp(-1.0, 1.0) };
-            for x in frame.iter_mut() {
-                *x = s;
-            }
-        }
+        playout.fill(out, ch, &shared, deaf);
     };
     let err = |e| eprintln!("speaker error: {e}");
     let stream = match fmt {
@@ -482,6 +577,40 @@ mod tests {
                 (x as f32 / u32::MAX as f32 * 2.0 - 1.0) * amp
             })
             .collect()
+    }
+
+    /// Voice arrives in 20 ms chunks with up to 8 ms of timing jitter; the
+    /// sound card pulls 10 ms at a time. Output must have no clicks.
+    #[test]
+    fn playback_has_no_clicks() {
+        let sh = Shared::new();
+        let mut p = Playout::new(48_000);
+        let tone = |n: usize| ((n as f32) * 200.0 * 6.283 / 48_000.0).sin() * 0.5;
+        let mut sent = 0usize;
+        let mut out_all = Vec::new();
+        let mut next_push = 0i64;
+        let mut rng: u32 = 7;
+        for ms in 0..5000i64 {
+            if ms >= next_push {
+                let pcm: Vec<i16> = (sent..sent + 960).map(|n| (tone(n) * 32767.0) as i16).collect();
+                sent += 960;
+                sh.push_out(&pcm);
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                next_push += 20 + (rng % 17) as i64 - 8;
+            }
+            if ms % 10 == 0 {
+                let mut buf = vec![0f32; 480];
+                p.fill(&mut buf, 1, &sh, false);
+                out_all.extend(buf);
+            }
+        }
+        let start = out_all.iter().position(|x| x.abs() > 0.01).unwrap();
+        let body = &out_all[start + 200..];
+        let max_jump = body.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        let silent_gaps = body.windows(240).filter(|w| w.iter().all(|x| x.abs() < 1e-3)).count();
+        println!("max jump {max_jump:.4} (a smooth tone moves at most 0.013), silent 5ms gaps {silent_gaps}, backlog {} ms", sh.out.lock().len() / MS);
+        assert!(max_jump < 0.03, "click detected");
+        assert_eq!(silent_gaps, 0);
     }
 
     #[test]

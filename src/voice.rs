@@ -39,8 +39,8 @@ fn driver_config() -> Config {
             Channels::Mono,
             SampleRate::Hz48000,
         )))
-        // 2 packets (40 ms) of jitter buffer instead of the default 5 (100 ms).
-        .playout_buffer_length(NonZeroU8::new(2).unwrap())
+        // 3 packets (60 ms) of jitter buffer instead of the default 5 (100 ms).
+        .playout_buffer_length(NonZeroU8::new(3).unwrap())
         .playout_spike_length(2)
         .mix_mode(MixMode::Mono)
         .use_softclip(false)
