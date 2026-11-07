@@ -1,0 +1,34 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      OPUS_BUNDLED: "1"
+      OPUS_STATIC: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release
+      - name: Size
+        shell: bash
+        run: ls -l target/release/tinycord.exe
+      - name: Publish to the "latest" release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest target/release/tinycord.exe \
+            --title "tinycord build ${{ github.run_number }}" \
+            --notes "Built from ${{ github.sha }}. Download tinycord.exe below."
