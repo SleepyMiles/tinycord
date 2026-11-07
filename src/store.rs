@@ -61,11 +61,18 @@ pub fn load_settings() {
             "auto_gain" => crate::voice::shared()
                 .auto_gain
                 .store(v.trim() != "0", std::sync::atomic::Ordering::Relaxed),
+            "input_volume" => {
+                if let Ok(x) = v.trim().parse::<f32>() {
+                    crate::voice::shared()
+                        .input_volume
+                        .store(x.clamp(0.0, 2.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             "vad_db" => {
                 if let Ok(db) = v.trim().parse::<f32>() {
                     crate::voice::shared()
                         .vad_db
-                        .store(db.clamp(-70.0, -10.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+                        .store(db.clamp(-80.0, 0.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
                 }
             }
             _ => {}
@@ -79,7 +86,7 @@ pub fn save_settings() {
         crate::voice::shared().vad_db.load(std::sync::atomic::Ordering::Relaxed),
     );
     let text = format!(
-        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\n",
+        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\n",
         match s.mode {
             MicMode::Open => "open",
             MicMode::Voice => "voice",
@@ -94,6 +101,7 @@ pub fn save_settings() {
         crate::voice::shared().auto_gain.load(std::sync::atomic::Ordering::Relaxed) as u8,
         if s.mic_chosen { format!("mic={}\n", s.mic_device.clone().unwrap_or_default()) } else { String::new() },
         s.spk_device.clone().unwrap_or_default(),
+        f32::from_bits(crate::voice::shared().input_volume.load(std::sync::atomic::Ordering::Relaxed)),
     );
     drop(s);
     let _ = std::fs::write(dir().join("settings.txt"), text);

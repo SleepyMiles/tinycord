@@ -36,6 +36,7 @@ const ID_NS: i32 = 114;
 const ID_AGC: i32 = 115;
 const ID_MIC: i32 = 116;
 const ID_SPKDEV: i32 = 117;
+const ID_VOL: i32 = 118;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_TOPMOST: usize = 2;
@@ -48,7 +49,6 @@ const OVERLAY_NAMES: [&str; 6] = [
     "Overlay: bottom-right",
     "Overlay: left-middle",
 ];
-const SENS: [(&str, f32); 3] = [("Mic sens: high", -55.0), ("Mic sens: medium", -45.0), ("Mic sens: low", -35.0)];
 
 #[derive(Clone, PartialEq)]
 enum RowKind {
@@ -70,7 +70,7 @@ struct Row {
 struct Ui {
     hwnd: HWND,
     overlay: HWND,
-    c: [HWND; 18],
+    c: [HWND; 19],
     font: HFONT,
     bold: HFONT,
     ofont: HFONT,
@@ -196,11 +196,26 @@ pub fn run() {
         };
         RegisterClassW(&wc2);
 
+        let sl_cls = wide("tinycord_slider");
+        let wc3 = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc: Some(slider_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: null_mut(),
+            hCursor: LoadCursorW(null_mut(), IDC_HAND),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: sl_cls.as_ptr(),
+        };
+        RegisterClassW(&wc3);
+
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
                 hwnd: null_mut(),
                 overlay: null_mut(),
-                c: [null_mut(); 18],
+                c: [null_mut(); 19],
                 font: make_font(dpi, 9, FW_NORMAL as i32),
                 bold: make_font(dpi, 9, FW_BOLD as i32),
                 ofont: make_font(dpi, 11, FW_SEMIBOLD as i32),
@@ -216,7 +231,7 @@ pub fn run() {
         });
 
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut r = RECT { left: 0, top: 0, right: sc(dpi, 280), bottom: sc(dpi, 488) };
+        let mut r = RECT { left: 0, top: 0, right: sc(dpi, 280), bottom: sc(dpi, 510) };
         AdjustWindowRect(&mut r, style, 0);
         let title = wide("tinycord");
         let hwnd = CreateWindowExW(
@@ -315,7 +330,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let cbo = |x, y, w, id| {
         child(hwnd, "COMBOBOX", "", ts | WS_VSCROLL | CBS_DROPDOWNLIST as u32, x, y, w, 300, id, dpi, font)
     };
-    let mut c = [null_mut(); 18];
+    let mut c = [null_mut(); 19];
     c[0] = child(hwnd, "STATIC", "Starting...", SS_LEFT as u32 | SS_ENDELLIPSIS as u32, 6, 6, 268, 18, ID_STATUS, dpi, font);
     c[1] = child(hwnd, "EDIT", "", ts | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32, 6, 28, 190, 24, ID_TOKEN, dpi, font);
     c[2] = b("Log in", BS_PUSHBUTTON, 202, 28, 72, 24, ID_LOGIN);
@@ -328,29 +343,29 @@ unsafe fn create_controls(hwnd: HWND) {
         6,
         58,
         268,
-        250,
+        226,
         ID_LIST,
         dpi,
         font,
     );
-    c[5] = b("Join", BS_PUSHBUTTON, 6, 314, 86, 26, ID_JOIN);
-    c[6] = b("Mute", BS_AUTOCHECKBOX | BS_PUSHLIKE, 97, 314, 86, 26, ID_MUTE);
-    c[7] = b("Deafen", BS_AUTOCHECKBOX | BS_PUSHLIKE, 188, 314, 86, 26, ID_DEAF);
-    c[8] = cbo(6, 346, 130, ID_MODE);
-    c[9] = b("PTT key: not set", BS_PUSHBUTTON, 142, 345, 132, 25, ID_KEY);
-    c[10] = cbo(6, 376, 130, ID_SENS);
-    c[11] = cbo(142, 376, 132, ID_OVERLAY);
-    c[12] = b("Speakers only", BS_AUTOCHECKBOX, 8, 406, 128, 22, ID_SPK);
-    c[13] = b("Keep on top", BS_AUTOCHECKBOX, 144, 406, 128, 22, ID_TOP);
-    c[14] = b("Noise suppression", BS_AUTOCHECKBOX, 8, 430, 128, 22, ID_NS);
-    c[15] = b("Auto gain", BS_AUTOCHECKBOX, 144, 430, 128, 22, ID_AGC);
-    c[16] = cbo(6, 458, 130, ID_MIC);
-    c[17] = cbo(142, 458, 132, ID_SPKDEV);
+    c[5] = b("Join", BS_PUSHBUTTON, 6, 290, 86, 26, ID_JOIN);
+    c[6] = b("Mute", BS_AUTOCHECKBOX | BS_PUSHLIKE, 97, 290, 86, 26, ID_MUTE);
+    c[7] = b("Deafen", BS_AUTOCHECKBOX | BS_PUSHLIKE, 188, 290, 86, 26, ID_DEAF);
+    c[8] = cbo(6, 322, 130, ID_MODE);
+    c[9] = b("PTT key: not set", BS_PUSHBUTTON, 142, 321, 132, 25, ID_KEY);
+    c[10] = child(hwnd, "tinycord_slider", "", 0, 6, 352, 268, 22, ID_SENS, dpi, font);
+    c[18] = child(hwnd, "tinycord_slider", "", 0, 6, 378, 268, 22, ID_VOL, dpi, font);
+    c[11] = cbo(6, 406, 130, ID_OVERLAY);
+    c[12] = b("Speakers only", BS_AUTOCHECKBOX, 144, 406, 128, 22, ID_SPK);
+    c[14] = b("Noise suppression", BS_AUTOCHECKBOX, 8, 432, 128, 22, ID_NS);
+    c[15] = b("Auto gain", BS_AUTOCHECKBOX, 144, 432, 128, 22, ID_AGC);
+    c[13] = b("Keep on top", BS_AUTOCHECKBOX, 8, 456, 128, 22, ID_TOP);
+    c[16] = cbo(6, 480, 130, ID_MIC);
+    c[17] = cbo(142, 480, 132, ID_SPKDEV);
     SendMessageW(c[16], CB_SETDROPPEDWIDTH, sc(dpi, 320) as usize, 0);
     SendMessageW(c[17], CB_SETDROPPEDWIDTH, sc(dpi, 320) as usize, 0);
 
     combo_add(c[8], &["Voice activation", "Push-to-talk", "Open mic"]);
-    combo_add(c[10], &SENS.map(|s| s.0));
     combo_add(c[11], &OVERLAY_NAMES);
 
     let s = state();
@@ -366,14 +381,6 @@ unsafe fn create_controls(hwnd: HWND) {
     let sh = crate::voice::shared();
     SendMessageW(c[14], BM_SETCHECK, sh.noise_suppression.load(Ordering::Relaxed) as usize, 0);
     SendMessageW(c[15], BM_SETCHECK, sh.auto_gain.load(Ordering::Relaxed) as usize, 0);
-    let vad = f32::from_bits(sh.vad_db.load(Ordering::Relaxed));
-    let sens_idx = SENS
-        .iter()
-        .enumerate()
-        .min_by(|a, b| (a.1 .1 - vad).abs().total_cmp(&(b.1 .1 - vad).abs()))
-        .map(|x| x.0)
-        .unwrap_or(1);
-    SendMessageW(c[10], CB_SETCURSEL, sens_idx, 0);
 
     with_ui(|u| {
         u.hwnd = hwnd;
@@ -391,6 +398,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             if wp == TIMER_REFRESH {
                 capture_key();
                 mic_meter(hwnd);
+                let live = { let s = state(); s.joined.is_some() && s.voice_ready };
+                if let Some(sl) = with_ui(|u| u.c[10]) {
+                    if live {
+                        InvalidateRect(sl, null(), 0);
+                    }
+                }
                 if state::DIRTY.swap(false, Ordering::AcqRel) {
                     refresh();
                 }
@@ -483,13 +496,6 @@ unsafe fn on_command(id: i32, code: u32) {
         (ID_KEY, BN_CLICKED) => {
             state().capturing_key = true;
             set_text(c[9], "Press a key... (Esc)");
-        }
-        (ID_SENS, CBN_SELCHANGE) => {
-            let i = SendMessageW(c[10], CB_GETCURSEL, 0, 0) as usize;
-            if let Some(s) = SENS.get(i) {
-                crate::voice::shared().vad_db.store(s.1.to_bits(), Ordering::Relaxed);
-                store::save_settings();
-            }
         }
         (ID_OVERLAY, CBN_SELCHANGE) => {
             let i = SendMessageW(c[11], CB_GETCURSEL, 0, 0);
@@ -767,7 +773,7 @@ unsafe fn refresh() {
     update_overlay();
 }
 
-unsafe fn update_devices(c: &[HWND; 18]) {
+unsafe fn update_devices(c: &[HWND; 19]) {
     let (ins, outs, mic, spk) = {
         let s = state();
         (s.input_devices.clone(), s.output_devices.clone(), s.mic_device.clone(), s.spk_device.clone())
@@ -862,6 +868,125 @@ unsafe fn draw_item(di: &DRAWITEMSTRUCT) {
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     r as u32 | (g as u32) << 8 | (b as u32) << 16
+}
+
+const SENS_MIN_DB: f32 = -80.0;
+
+/// (bar left, bar right) inside a slider of client width `w`.
+fn slider_bar(dpi: i32, w: i32) -> (i32, i32) {
+    (sc(dpi, 78), w - sc(dpi, 48))
+}
+
+unsafe fn slider_set_from_x(hwnd: HWND, x: i32) {
+    let dpi = with_ui(|u| u.dpi).unwrap_or(96);
+    let mut rc: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rc);
+    let (l, r) = slider_bar(dpi, rc.right);
+    let frac = ((x - l) as f32 / (r - l).max(1) as f32).clamp(0.0, 1.0);
+    let sh = crate::voice::shared();
+    if GetDlgCtrlID(hwnd) == ID_SENS {
+        let db = SENS_MIN_DB + frac * -SENS_MIN_DB;
+        sh.vad_db.store(db.round().to_bits(), Ordering::Relaxed);
+    } else {
+        let mut v = frac * 2.0;
+        if (v - 1.0).abs() < 0.04 {
+            v = 1.0; // easy to land back on 100%
+        }
+        sh.input_volume.store(v.to_bits(), Ordering::Relaxed);
+    }
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Discord-style slider. Sensitivity: the bar shows your live mic level
+/// (green = loud enough to send, yellow = below the line) and the handle is
+/// the line. Input volume: 0-200%.
+unsafe extern "system" fn slider_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let x_of = |lp: LPARAM| (lp & 0xFFFF) as u16 as i16 as i32;
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_LBUTTONDOWN => {
+            SetCapture(hwnd);
+            slider_set_from_x(hwnd, x_of(lp));
+            0
+        }
+        WM_MOUSEMOVE => {
+            if GetCapture() == hwnd {
+                slider_set_from_x(hwnd, x_of(lp));
+            }
+            0
+        }
+        WM_LBUTTONUP => {
+            if GetCapture() == hwnd {
+                ReleaseCapture();
+                store::save_settings();
+            }
+            0
+        }
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let mem = CreateCompatibleDC(hdc);
+            let bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
+            let old_bmp = SelectObject(mem, bmp as _);
+            FillRect(mem, &rc, GetSysColorBrush(COLOR_BTNFACE));
+            let (dpi, font) = with_ui(|u| (u.dpi, u.font)).unwrap_or((96, null_mut()));
+            SelectObject(mem, font as _);
+            SetBkMode(mem, TRANSPARENT as i32);
+            SetTextColor(mem, rgb(30, 30, 30));
+
+            let sh = crate::voice::shared();
+            let is_sens = GetDlgCtrlID(hwnd) == ID_SENS;
+            let (l, r) = slider_bar(dpi, rc.right);
+            let bh = sc(dpi, 10);
+            let top = (rc.bottom - bh) / 2;
+            let fill = |x0: i32, x1: i32, color: COLORREF| {
+                let b = CreateSolidBrush(color);
+                let rr = RECT { left: x0, top, right: x1.max(x0), bottom: top + bh };
+                FillRect(mem, &rr, b);
+                DeleteObject(b as _);
+            };
+            fill(l, r, rgb(205, 205, 210));
+            let (label, value, frac) = if is_sens {
+                let thr = f32::from_bits(sh.vad_db.load(Ordering::Relaxed));
+                let live = { let s = state(); s.joined.is_some() && s.voice_ready };
+                if live {
+                    let lvl = f32::from_bits(sh.vad_level.load(Ordering::Relaxed));
+                    let lf = ((lvl - SENS_MIN_DB) / -SENS_MIN_DB).clamp(0.0, 1.0);
+                    let color = if lvl > thr { rgb(60, 190, 90) } else { rgb(235, 185, 40) };
+                    fill(l, l + ((r - l) as f32 * lf) as i32, color);
+                }
+                ("Sensitivity", format!("{:.0} dB", thr), (thr - SENS_MIN_DB) / -SENS_MIN_DB)
+            } else {
+                let v = f32::from_bits(sh.input_volume.load(Ordering::Relaxed));
+                fill(l, l + ((r - l) as f32 * v / 2.0) as i32, rgb(70, 130, 220));
+                ("Input volume", format!("{:.0}%", v * 100.0), v / 2.0)
+            };
+            // Handle
+            let hx = l + ((r - l) as f32 * frac.clamp(0.0, 1.0)) as i32;
+            let hw = sc(dpi, 3);
+            let b = CreateSolidBrush(rgb(40, 40, 45));
+            let hr = RECT { left: hx - hw, top: sc(dpi, 2), right: hx + hw, bottom: rc.bottom - sc(dpi, 2) };
+            FillRect(mem, &hr, b);
+            DeleteObject(b as _);
+
+            let mut lr = RECT { left: sc(dpi, 2), top: 0, right: l - sc(dpi, 4), bottom: rc.bottom };
+            let t = wide(label);
+            DrawTextW(mem, t.as_ptr(), -1, &mut lr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            let mut vr = RECT { left: r + sc(dpi, 6), top: 0, right: rc.right, bottom: rc.bottom };
+            let t = wide(&value);
+            DrawTextW(mem, t.as_ptr(), -1, &mut vr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+
+            BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old_bmp);
+            DeleteObject(bmp as _);
+            DeleteDC(mem);
+            EndPaint(hwnd, &ps);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
 }
 
 /// Lines for the overlay: (name, talking, dim).

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use nnnoiseless::DenoiseState;
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub const RATE: usize = 48_000;
 const MS: usize = RATE / 1000;
@@ -49,6 +49,15 @@ pub struct Shared {
     pub auto_gain: AtomicBool,
     /// Current auto-gain multiplier (f32 bits), shown in the title bar.
     pub agc_gain: AtomicU32,
+    /// Input volume multiplier 0.0..=2.0 (f32 bits), like Discord's slider.
+    pub input_volume: AtomicU32,
+    /// Mic level the sensitivity slider compares against (dBFS, f32 bits):
+    /// after noise suppression, before gain.
+    pub vad_level: AtomicU32,
+    /// true = let mic audio through; false = fade it out (end of talking).
+    pub gate_open: AtomicBool,
+    /// Set once the fade-out has reached silence.
+    pub faded_out: AtomicBool,
 }
 
 impl Shared {
@@ -63,6 +72,10 @@ impl Shared {
             noise_suppression: AtomicBool::new(true),
             auto_gain: AtomicBool::new(true),
             agc_gain: AtomicU32::new(1f32.to_bits()),
+            input_volume: AtomicU32::new(1f32.to_bits()),
+            vad_level: AtomicU32::new((-100f32).to_bits()),
+            gate_open: AtomicBool::new(false),
+            faded_out: AtomicBool::new(true),
         })
     }
 
@@ -213,6 +226,7 @@ impl MicProcessor {
             }
             let rms = (sum / N as f32).sqrt();
             let db = 20.0 * rms.max(1e-9).log10();
+            shared.vad_level.store(db.to_bits(), Ordering::Relaxed);
             let voice = db > threshold && (!ns_on || vad_prob > 0.5);
             if voice {
                 shared.last_voice_ms.store(shared.now_ms(), Ordering::Relaxed);
@@ -229,11 +243,12 @@ impl MicProcessor {
                 self.gain = 1.0;
             }
             shared.agc_gain.store(self.gain.to_bits(), Ordering::Relaxed);
+            let volume = f32::from_bits(shared.input_volume.load(Ordering::Relaxed)).clamp(0.0, 2.0);
             // Peak limiter: if a sample would go over 0.9, turn down at once
             // and recover over ~50 ms. Avoids the distortion of clipping.
             let mut sent = 0f32;
             for s in self.frame_out.iter() {
-                let x = s * self.gain;
+                let x = s * self.gain * volume;
                 let need = if x.abs() * self.limit > 0.9 { 0.9 / x.abs() } else { 1.0 };
                 if need < self.limit {
                     self.limit = need;
@@ -519,11 +534,13 @@ pub struct MicSource {
     pending: Vec<u8>,
     last: f32,
     short_reads: u64,
+    /// 0..1 fade applied to what we send (see `Shared::gate_open`).
+    env: f32,
 }
 
 impl MicSource {
     pub fn new(shared: Arc<Shared>) -> Self {
-        Self { shared, pending: Vec::new(), last: 0.0, short_reads: 0 }
+        Self { shared, pending: Vec::new(), last: 0.0, short_reads: 0, env: 0.0 }
     }
 }
 
@@ -534,23 +551,39 @@ impl std::io::Read for MicSource {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.pending.is_empty() {
             let want = (buf.len() / 4).clamp(1, 20 * MS);
-            let mut m = self.shared.mic.lock();
-            let n = want.min(m.len());
-            for s in m.drain(..n) {
-                self.last = s;
-                self.pending.extend_from_slice(&s.to_le_bytes());
+            let mut samples: Vec<f32> = Vec::with_capacity(want);
+            {
+                let mut m = self.shared.mic.lock();
+                let n = want.min(m.len());
+                samples.extend(m.drain(..n));
             }
-            drop(m);
-            if n < want {
+            if let Some(l) = samples.last() {
+                self.last = *l;
+            }
+            if samples.len() < want {
                 self.short_reads += 1;
                 if self.short_reads % 50 == 1 {
-                    tracing::info!("mic short read #{} ({} of {} samples)", self.short_reads, n, want);
+                    tracing::info!("mic short read #{} ({} of {} samples)", self.short_reads, samples.len(), want);
                 }
-                for _ in n..want {
+                while samples.len() < want {
                     self.last *= 0.99;
-                    self.pending.extend_from_slice(&self.last.to_le_bytes());
+                    samples.push(self.last);
                 }
             }
+            // Fade in over 5 ms when sending starts, out over 20 ms when it
+            // stops, so a sentence never ends mid-waveform (the end "pop").
+            let open = self.shared.gate_open.load(Ordering::Relaxed);
+            let (target, step) = if open { (1.0, 1.0 / (5 * MS) as f32) } else { (0.0, 1.0 / (20 * MS) as f32) };
+            for x in samples.iter_mut() {
+                if self.env < target {
+                    self.env = (self.env + step).min(target);
+                } else if self.env > target {
+                    self.env = (self.env - step).max(target);
+                }
+                *x *= self.env;
+                self.pending.extend_from_slice(&x.to_le_bytes());
+            }
+            self.shared.faded_out.store(!open && self.env == 0.0, Ordering::Relaxed);
         }
         let n = buf.len().min(self.pending.len());
         buf[..n].copy_from_slice(&self.pending[..n]);
@@ -659,6 +692,7 @@ mod tests {
             }
             if ms == 200 {
                 sh.trim_mic_preroll(); // "start sending"
+                sh.gate_open.store(true, Ordering::Relaxed);
                 started = true;
             }
             if started && ms % 20 == 0 {
@@ -670,12 +704,21 @@ mod tests {
                 sent.extend(buf.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
             }
         }
+        let short_while_talking = src.short_reads;
+        // Stop talking: the gate closes and the voice must fade, not cut.
+        sh.gate_open.store(false, Ordering::Relaxed);
+        for _ in 0..3 {
+            let mut buf = vec![0u8; 3840];
+            src.read(&mut buf).unwrap();
+            sent.extend(buf.chunks(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+        }
+        assert!(sh.faded_out.load(Ordering::Relaxed));
+        assert!(sent.last().unwrap().abs() < 1e-6);
         let body = &sent[960..];
         let max_jump = body.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
-        println!("send: max jump {max_jump:.4} (smooth tone: 0.013), short reads {}, backlog {} ms",
-            src.short_reads, sh.mic.lock().len() / MS);
+        println!("send: max jump {max_jump:.4} (smooth tone: 0.013), short reads {short_while_talking}, faded to silence at the end");
         assert!(max_jump < 0.03, "click in sent audio");
-        assert_eq!(src.short_reads, 0);
+        assert_eq!(short_while_talking, 0);
     }
 
     #[test]

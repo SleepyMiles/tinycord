@@ -243,6 +243,8 @@ impl Rx {
 pub fn transmit_loop(key_down: fn(u32) -> bool) {
     let sh = shared().clone();
     let mut sending = false;
+    let mut track_playing = false;
+    let mut pause_after: Option<Instant> = None;
     let mut shown_talking = false;
     loop {
         std::thread::sleep(Duration::from_millis(10));
@@ -266,20 +268,40 @@ pub fn transmit_loop(key_down: fn(u32) -> bool) {
                 MicMode::Voice => voice_now,
                 MicMode::Ptt => key != 0 && key_down(key),
             };
-        if want != sending {
-            if let Some(h) = TRACK.lock().as_ref() {
-                let r = if want {
-                    sh.trim_mic_preroll();
-                    h.play()
-                } else {
-                    h.pause()
-                };
-                if let Err(e) = r {
-                    tracing::warn!("mic track control failed: {e:?}");
-                    state::set_status("Mic stopped working - rejoin the channel");
+        if want && !sending {
+            // Start: open the gate (fades in) and make sure the track plays.
+            sh.gate_open.store(true, Ordering::Relaxed);
+            if !track_playing {
+                sh.trim_mic_preroll();
+                if let Some(h) = TRACK.lock().as_ref() {
+                    if let Err(e) = h.play() {
+                        tracing::warn!("mic track control failed: {e:?}");
+                        state::set_status("Mic stopped working - rejoin the channel");
+                    }
                 }
+                track_playing = true;
             }
-            sending = want;
+            pause_after = None;
+            sending = true;
+        } else if !want && sending {
+            // Stop: fade out first; pause the track once the fade is done
+            // and a little silence has gone out.
+            sh.gate_open.store(false, Ordering::Relaxed);
+            pause_after = Some(Instant::now() + Duration::from_millis(80));
+            sending = false;
+        }
+        if let Some(t) = pause_after {
+            if Instant::now() >= t && sh.faded_out.load(Ordering::Relaxed) {
+                if let Some(h) = TRACK.lock().as_ref() {
+                    let _ = h.pause();
+                }
+                track_playing = false;
+                pause_after = None;
+            }
+        }
+        if !live {
+            track_playing = false;
+            pause_after = None;
         }
         let talking = sending && (mode != MicMode::Open || voice_now);
         if talking != shown_talking {
