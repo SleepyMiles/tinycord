@@ -23,6 +23,10 @@ jobs:
       - name: Check NASM
         run: nasm -v
       - uses: Swatinem/rust-cache@v2
+        with:
+          # New cache so OpenH264 gets rebuilt with NASM (its build script
+          # doesn't notice NASM appearing on its own).
+          prefix-key: "v1-nasm"
       - name: Build
         run: cargo build --release
       - name: Size
