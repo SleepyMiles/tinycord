@@ -610,6 +610,7 @@ fn encode_thread(
     let mut last_idr = Instant::now() - Duration::from_secs(60);
     let mut need_idr = true;
     let mut pk = VideoPacketizer::new(sh.video_ssrc);
+    let mut last_at = t0;
     // A still screen is re-sent a few times a second so viewers who join
     // (or lose a packet) get a picture without waiting for a change.
     let repeat = Duration::from_millis(250);
@@ -625,6 +626,9 @@ fn encode_thread(
             None if last.is_some() => Instant::now(),
             None => continue,
         };
+        // Timestamps must only go forward.
+        let at = at.max(last_at + Duration::from_millis(1));
+        last_at = at;
         let pic = &last.as_ref().unwrap().pic;
         let (w, h) = (pic.w, pic.h);
         if w == 0 || h == 0 {

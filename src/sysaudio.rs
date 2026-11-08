@@ -47,11 +47,9 @@ pub fn run(stop: Arc<AtomicBool>, mut sink: impl FnMut(&[f32], std::time::Durati
                 return Err(format!("PC sound stopped: {e}"));
             }
         }
-        while raw.len() >= 4 {
-            let b = [raw[0], raw[1], raw[2], raw[3]];
-            raw.drain(..4);
-            samples.push(f32::from_le_bytes(b));
-        }
+        let whole = raw.len() / 4 * 4;
+        let bytes: Vec<u8> = raw.drain(..whole).collect();
+        samples.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
         let mut used = 0;
         while samples.len() - used >= CHUNK {
             let now = Instant::now();
