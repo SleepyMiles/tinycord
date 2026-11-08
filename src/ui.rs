@@ -1087,8 +1087,25 @@ static VIEW_HWND: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
 thread_local! {
     /// Saved placement while the viewer is fullscreen.
     static VIEW_FULL: std::cell::Cell<Option<WINDOWPLACEMENT>> = const { std::cell::Cell::new(None) };
-    static VIEW_TOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static VIEW_UI: RefCell<ViewUi> = RefCell::new(ViewUi::default());
 }
+
+/// Viewer control bar state (UI thread only).
+struct ViewUi {
+    bar: bool,
+    last_move: std::time::Instant,
+    dragging: bool,
+    /// Volume before M muted the stream.
+    unmute_to: Option<f32>,
+}
+
+impl Default for ViewUi {
+    fn default() -> Self {
+        Self { bar: true, last_move: std::time::Instant::now(), dragging: false, unmute_to: None }
+    }
+}
+
+const VIEW_TIMER: usize = 1;
 
 /// Called from the video thread when a new picture is ready.
 fn view_repaint() {
@@ -1096,6 +1113,34 @@ fn view_repaint() {
     if !h.is_null() {
         unsafe { InvalidateRect(h, null(), 0) };
     }
+}
+
+fn stream_volume() -> f32 {
+    f32::from_bits(crate::video::STREAM_VOLUME.load(Ordering::Relaxed))
+}
+
+fn set_stream_volume(v: f32) {
+    let mut v = v.clamp(0.0, 2.0);
+    if (v - 1.0).abs() < 0.03 {
+        v = 1.0; // easy to land back on 100%
+    }
+    crate::video::STREAM_VOLUME.store(v.to_bits(), Ordering::Relaxed);
+}
+
+fn is_pinned() -> bool {
+    crate::video::STREAM_PIN.load(Ordering::Relaxed)
+}
+
+unsafe fn apply_pin(hwnd: HWND) {
+    let after = if is_pinned() { HWND_TOPMOST } else { HWND_NOTOPMOST };
+    SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+unsafe fn toggle_pin(hwnd: HWND) {
+    crate::video::STREAM_PIN.store(!is_pinned(), Ordering::Relaxed);
+    apply_pin(hwnd);
+    store::save_settings();
+    InvalidateRect(hwnd, null(), 0);
 }
 
 /// Open or close the viewer to match `state().watching`.
@@ -1125,7 +1170,10 @@ unsafe fn update_viewer() {
                 null(),
             );
             VIEW_HWND.store(hwnd, Ordering::Release);
+            VIEW_UI.with(|v| *v.borrow_mut() = ViewUi::default());
             ShowWindow(hwnd, SW_SHOW);
+            apply_pin(hwnd);
+            SetTimer(hwnd, VIEW_TIMER, 250, None);
         }
         (None, false) => {
             VIEW_HWND.store(null_mut(), Ordering::Release);
@@ -1138,11 +1186,20 @@ unsafe fn update_viewer() {
     }
 }
 
+unsafe fn is_fullscreen() -> bool {
+    VIEW_FULL.with(|f| {
+        let v = f.take();
+        let some = v.is_some();
+        f.set(v);
+        some
+    })
+}
+
 unsafe fn toggle_fullscreen(hwnd: HWND) {
     if let Some(wp) = VIEW_FULL.with(|f| f.take()) {
         SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as isize);
         SetWindowPlacement(hwnd, &wp);
-        let after = if VIEW_TOP.with(|t| t.get()) { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        let after = if is_pinned() { HWND_TOPMOST } else { HWND_NOTOPMOST };
         SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
     } else {
         let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
@@ -1157,9 +1214,129 @@ unsafe fn toggle_fullscreen(hwnd: HWND) {
         let m = mi.rcMonitor;
         SetWindowPos(hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED);
     }
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Where the control bar's parts are, for a `cw`x`ch` client area.
+struct Bar {
+    bar: RECT,
+    pin: RECT,
+    label: RECT,
+    track: RECT,
+    value: RECT,
+    full: RECT,
+}
+
+fn bar_layout(dpi: i32, cw: i32, ch: i32) -> Bar {
+    let h = sc(dpi, 38);
+    let top = ch - h;
+    let pad = sc(dpi, 8);
+    let by = top + sc(dpi, 6);
+    let bb = ch - sc(dpi, 6);
+    let pin = RECT { left: pad, top: by, right: pad + sc(dpi, 76), bottom: bb };
+    let full = RECT { left: cw - pad - sc(dpi, 96), top: by, right: cw - pad, bottom: bb };
+    let label = RECT { left: pin.right + sc(dpi, 14), top, right: pin.right + sc(dpi, 70), bottom: ch };
+    let value = RECT { left: full.left - sc(dpi, 58), top, right: full.left - sc(dpi, 10), bottom: ch };
+    let mid = top + h / 2;
+    let track = RECT {
+        left: label.right + sc(dpi, 4),
+        top: mid - sc(dpi, 3),
+        right: (value.left - sc(dpi, 10)).max(label.right + sc(dpi, 44)),
+        bottom: mid + sc(dpi, 3),
+    };
+    Bar { bar: RECT { left: 0, top, right: cw, bottom: ch }, pin, label, track, value, full }
+}
+
+fn inside(r: &RECT, x: i32, y: i32) -> bool {
+    x >= r.left && x < r.right && y >= r.top && y < r.bottom
+}
+
+unsafe fn view_bar(hwnd: HWND) -> Bar {
+    let mut rc: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut rc);
+    bar_layout(with_ui(|u| u.dpi).unwrap_or(96), rc.right, rc.bottom)
+}
+
+unsafe fn volume_from_x(hwnd: HWND, x: i32) {
+    let b = view_bar(hwnd);
+    let frac = (x - b.track.left) as f32 / (b.track.right - b.track.left).max(1) as f32;
+    set_stream_volume(frac.clamp(0.0, 1.0) * 2.0);
+    VIEW_UI.with(|v| v.borrow_mut().unmute_to = None);
+    InvalidateRect(hwnd, null(), 0);
+}
+
+/// Mouse button down (or double-click) at x,y. Returns true if the bar took it.
+unsafe fn bar_click(hwnd: HWND, x: i32, y: i32) -> bool {
+    if !VIEW_UI.with(|v| v.borrow().bar) {
+        return false;
+    }
+    let b = view_bar(hwnd);
+    if !inside(&b.bar, x, y) {
+        return false;
+    }
+    if inside(&b.pin, x, y) {
+        toggle_pin(hwnd);
+    } else if inside(&b.full, x, y) {
+        toggle_fullscreen(hwnd);
+    } else if x >= b.track.left - 8 && x <= b.track.right + 8 {
+        VIEW_UI.with(|v| v.borrow_mut().dragging = true);
+        SetCapture(hwnd);
+        volume_from_x(hwnd, x);
+    }
+    true
+}
+
+unsafe fn paint_bar(hdc: HDC, b: &Bar, dpi: i32) {
+    let fill = |r: &RECT, c: COLORREF| {
+        let br = CreateSolidBrush(c);
+        FillRect(hdc, r, br);
+        DeleteObject(br as _);
+    };
+    let button = |r: &RECT, c: COLORREF, text: &str| {
+        let br = CreateSolidBrush(c);
+        let ob = SelectObject(hdc, br as _);
+        let op = SelectObject(hdc, GetStockObject(NULL_PEN));
+        RoundRect(hdc, r.left, r.top, r.right + 1, r.bottom + 1, sc(dpi, 8), sc(dpi, 8));
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        DeleteObject(br as _);
+        let mut rr = *r;
+        let t = wide(text);
+        SetTextColor(hdc, rgb(255, 255, 255));
+        DrawTextW(hdc, t.as_ptr(), -1, &mut rr, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+    };
+    let accent = rgb(88, 101, 242);
+    let grey = rgb(64, 66, 73);
+    fill(&b.bar, rgb(30, 31, 34));
+    let font = with_ui(|u| u.bold).unwrap_or(null_mut());
+    SelectObject(hdc, font as _);
+    SetBkMode(hdc, TRANSPARENT as i32);
+    let pinned = is_pinned();
+    button(&b.pin, if pinned { accent } else { grey }, if pinned { "Pinned" } else { "Pin" });
+    button(&b.full, grey, if is_fullscreen() { "Exit full" } else { "Fullscreen" });
+
+    SetTextColor(hdc, rgb(200, 200, 205));
+    let mut lr = b.label;
+    let t = wide("Volume");
+    DrawTextW(hdc, t.as_ptr(), -1, &mut lr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    let vol = stream_volume();
+    let mut vr = b.value;
+    let t = wide(&if vol == 0.0 { "Muted".to_string() } else { format!("{:.0}%", vol * 100.0) });
+    DrawTextW(hdc, t.as_ptr(), -1, &mut vr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+
+    let tr = b.track;
+    fill(&tr, rgb(78, 80, 88));
+    let x = tr.left + ((tr.right - tr.left) as f32 * vol / 2.0) as i32;
+    fill(&RECT { left: tr.left, top: tr.top, right: x, bottom: tr.bottom }, accent);
+    // Mark at 100%.
+    let mid = (tr.left + tr.right) / 2;
+    fill(&RECT { left: mid, top: tr.top - sc(dpi, 3), right: mid + 1, bottom: tr.bottom + sc(dpi, 3) }, rgb(140, 140, 150));
+    let hw = sc(dpi, 4);
+    fill(&RECT { left: x - hw, top: tr.top - sc(dpi, 6), right: x + hw, bottom: tr.bottom + sc(dpi, 6) }, rgb(255, 255, 255));
 }
 
 unsafe extern "system" fn view_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let xy = |lp: LPARAM| ((lp & 0xFFFF) as u16 as i16 as i32, ((lp >> 16) & 0xFFFF) as u16 as i16 as i32);
     match msg {
         WM_SIZE => {
             let w = (lp & 0xFFFF) as u32;
@@ -1172,31 +1349,115 @@ unsafe extern "system" fn view_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             0
         }
         WM_ERASEBKGND => 1,
+        WM_TIMER => {
+            // Hide the bar after 2.5 s without mouse movement (not while
+            // the mouse is on it, dragging, or there's no picture yet).
+            let has_pic = !crate::video::rendered().lock().px.is_empty();
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            ScreenToClient(hwnd, &mut pt);
+            let over_bar = inside(&view_bar(hwnd).bar, pt.x, pt.y);
+            let hide = VIEW_UI.with(|v| {
+                let v = v.borrow();
+                v.bar && has_pic && !v.dragging && !over_bar && v.last_move.elapsed().as_millis() > 2500
+            });
+            if hide {
+                VIEW_UI.with(|v| v.borrow_mut().bar = false);
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        WM_MOUSEMOVE => {
+            let (x, _) = xy(lp);
+            let (was, dragging) = VIEW_UI.with(|v| {
+                let mut v = v.borrow_mut();
+                v.last_move = std::time::Instant::now();
+                let was = v.bar;
+                v.bar = true;
+                (was, v.dragging)
+            });
+            if dragging {
+                volume_from_x(hwnd, x);
+            } else if !was {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            0
+        }
+        WM_SETCURSOR => {
+            // Hide the mouse pointer in fullscreen once the bar is hidden.
+            let hidden = !VIEW_UI.with(|v| v.borrow().bar);
+            if hidden && is_fullscreen() && (lp & 0xFFFF) as u32 == HTCLIENT {
+                SetCursor(null_mut());
+                return 1;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_LBUTTONDOWN => {
+            let (x, y) = xy(lp);
+            bar_click(hwnd, x, y);
+            0
+        }
+        WM_LBUTTONUP => {
+            if VIEW_UI.with(|v| std::mem::take(&mut v.borrow_mut().dragging)) {
+                ReleaseCapture();
+                store::save_settings();
+            }
+            0
+        }
         WM_LBUTTONDBLCLK => {
-            toggle_fullscreen(hwnd);
+            let (x, y) = xy(lp);
+            if !bar_click(hwnd, x, y) {
+                toggle_fullscreen(hwnd);
+            }
+            0
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wp >> 16) & 0xFFFF) as u16 as i16 as f32 / 120.0;
+            set_stream_volume(stream_volume() + delta * 0.05);
+            VIEW_UI.with(|v| {
+                let mut v = v.borrow_mut();
+                v.bar = true;
+                v.last_move = std::time::Instant::now();
+                v.unmute_to = None;
+            });
+            store::save_settings();
+            InvalidateRect(hwnd, null(), 0);
             0
         }
         WM_KEYDOWN => {
             match wp as u32 {
-                0x1B => {
-                    // Esc leaves fullscreen.
-                    let full = VIEW_FULL.with(|f| {
-                        let v = f.take();
-                        let some = v.is_some();
-                        f.set(v);
-                        some
+                0x1B if is_fullscreen() => toggle_fullscreen(hwnd), // Esc
+                0x7A => toggle_fullscreen(hwnd),                     // F11
+                0x54 => toggle_pin(hwnd),                            // T / pin
+                0x26 | 0x28 => {
+                    // Up / Down: volume
+                    let step = if wp as u32 == 0x26 { 0.05 } else { -0.05 };
+                    set_stream_volume(stream_volume() + step);
+                    store::save_settings();
+                    VIEW_UI.with(|v| {
+                        let mut v = v.borrow_mut();
+                        v.bar = true;
+                        v.last_move = std::time::Instant::now();
                     });
-                    if full {
-                        toggle_fullscreen(hwnd);
-                    }
+                    InvalidateRect(hwnd, null(), 0);
                 }
-                0x7A => toggle_fullscreen(hwnd), // F11
-                0x54 => {
-                    // T: keep on top
-                    let on = !VIEW_TOP.with(|t| t.get());
-                    VIEW_TOP.with(|t| t.set(on));
-                    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
-                    SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                0x4D => {
+                    // M: mute / unmute the stream
+                    let back = VIEW_UI.with(|v| v.borrow_mut().unmute_to.take());
+                    match back {
+                        Some(v) => set_stream_volume(v),
+                        None => {
+                            let cur = stream_volume();
+                            VIEW_UI.with(|v| v.borrow_mut().unmute_to = Some(if cur > 0.0 { cur } else { 1.0 }));
+                            set_stream_volume(0.0);
+                        }
+                    }
+                    store::save_settings();
+                    VIEW_UI.with(|v| {
+                        let mut v = v.borrow_mut();
+                        v.bar = true;
+                        v.last_move = std::time::Instant::now();
+                    });
                     InvalidateRect(hwnd, null(), 0);
                 }
                 _ => {}
@@ -1208,6 +1469,13 @@ unsafe extern "system" fn view_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             let hdc = BeginPaint(hwnd, &mut ps);
             let mut rc: RECT = std::mem::zeroed();
             GetClientRect(hwnd, &mut rc);
+            let dpi = with_ui(|u| u.dpi).unwrap_or(96);
+            let show_bar = VIEW_UI.with(|v| v.borrow().bar);
+            let bar = bar_layout(dpi, rc.right, rc.bottom);
+            if show_bar {
+                // Keep the picture from drawing under the bar (no flicker).
+                ExcludeClipRect(hdc, bar.bar.left, bar.bar.top, bar.bar.right, bar.bar.bottom);
+            }
             let black = GetStockObject(BLACK_BRUSH) as HBRUSH;
             let pic = crate::video::rendered().lock();
             let status = crate::video::info().lock().1.clone();
@@ -1252,19 +1520,24 @@ unsafe extern "system" fn view_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             drop(pic);
             if !status.is_empty() {
-                let (dpi, font) = with_ui(|u| (u.dpi, u.ofont)).unwrap_or((96, null_mut()));
+                let font = with_ui(|u| u.ofont).unwrap_or(null_mut());
                 SelectObject(hdc, font as _);
                 SetBkMode(hdc, TRANSPARENT as i32);
                 SetTextColor(hdc, rgb(220, 220, 225));
-                let mut tr = RECT { left: sc(dpi, 12), top: sc(dpi, 10), right: rc.right - sc(dpi, 12), bottom: rc.bottom };
+                let mut tr = RECT { left: sc(dpi, 12), top: sc(dpi, 10), right: rc.right - sc(dpi, 12), bottom: bar.bar.top };
                 let t = wide(&status);
                 DrawTextW(hdc, t.as_ptr(), -1, &mut tr, DT_WORDBREAK | DT_NOPREFIX);
+            }
+            if show_bar {
+                SelectClipRgn(hdc, null_mut());
+                paint_bar(hdc, &bar, dpi);
             }
             EndPaint(hwnd, &ps);
             0
         }
         WM_CLOSE => {
             // Close right away; the network side catches up.
+            KillTimer(hwnd, VIEW_TIMER);
             state().watching = None;
             state::send(Cmd::StopWatch);
             VIEW_HWND.store(null_mut(), Ordering::Release);

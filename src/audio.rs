@@ -813,8 +813,9 @@ fn build_output(
         if stream_playout.playing || stream_playout.last.abs() > 1e-4 || !shared.stream_out.lock().is_empty() {
             extra.resize(out.len(), 0.0);
             stream_playout.fill(&mut extra, ch, &shared, deaf);
+            let vol = f32::from_bits(crate::video::STREAM_VOLUME.load(Ordering::Relaxed));
             for (o, e) in out.iter_mut().zip(extra.iter()) {
-                *o = (*o + *e).clamp(-1.0, 1.0);
+                *o = (*o + *e * vol).clamp(-1.0, 1.0);
             }
         }
     };

@@ -375,6 +375,10 @@ pub fn rendered() -> &'static Mutex<Rendered> {
     R.get_or_init(|| Mutex::new(Rendered::default()))
 }
 
+/// Stream volume 0.0..=2.0 (f32 bits) and "keep the viewer on top".
+pub static STREAM_VOLUME: AtomicU32 = AtomicU32::new(0x3F80_0000); // 1.0
+pub static STREAM_PIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Viewer window client size, set by the UI.
 pub static TARGET_W: AtomicU32 = AtomicU32::new(960);
 pub static TARGET_H: AtomicU32 = AtomicU32::new(540);

@@ -39,9 +39,13 @@ To log out, delete `%APPDATA%\tinycord\token.bin`.
 - **Double-click** them, or select them and press **Watch**. If you aren't in
   their channel yet, tinycord joins it first.
 - The stream opens in its own window, and its sound plays through your
-  speakers.
-  - **Double-click** or press **F11**: fullscreen. **Esc** exits fullscreen.
-  - **T**: keep the window on top.
+  speakers. Move the mouse over it to show the control bar:
+  - **Pin**: keeps the stream window on top of other windows (and games in
+    Windowed Fullscreen). Shortcut: **T**.
+  - **Volume** slider: 0-200% (stream sound only). Also mouse wheel or
+    **Up/Down**; **M** mutes and unmutes.
+  - **Fullscreen**: also double-click or **F11**; **Esc** exits.
+  - The bar hides after a few seconds. Pin and volume are remembered.
   - Close the window to stop watching.
 - Only **H.264** streams can be shown for now. If a stream uses another codec,
   the window says so.
