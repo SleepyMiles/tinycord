@@ -33,6 +33,20 @@ To log out, delete `%APPDATA%\tinycord\token.bin`.
   aren't talking.
 - **Keep on top**: pins the main window too.
 
+## Watching a screen share (Go Live)
+
+- People who are streaming have a red **LIVE** tag next to their name.
+- **Double-click** them, or select them and press **Watch**. If you aren't in
+  their channel yet, tinycord joins it first.
+- The stream opens in its own window, and its sound plays through your
+  speakers.
+  - **Double-click** or press **F11**: fullscreen. **Esc** exits fullscreen.
+  - **T**: keep the window on top.
+  - Close the window to stop watching.
+- Only **H.264** streams can be shown for now. If a stream uses another codec,
+  the window says so.
+- The video decoder only runs while the window is open.
+
 ## Overlay over Valorant
 
 Set Valorant's display mode to **Windowed Fullscreen**. Windows doesn't let
@@ -57,4 +71,8 @@ the game.
   joined the voice session (songbird issue #310), which made DAVE drop other
   people's audio. tinycord passes the member list it already has from the
   main connection.
+- Stream video: H.264 RTP reassembly (`src/video.rs`), DAVE video
+  decryption via `davey`, decoding with OpenH264 (built from source). Songbird
+  is patched to run a viewer-only video connection (`Config::video_receive`),
+  hand video packets to tinycord, and send RTCP keyframe requests.
 - GitHub Actions builds the `.exe` on each push to `main`.

@@ -36,6 +36,8 @@ const OUT_CATCHUP: usize = 50 * MS;
 pub struct Shared {
     pub mic: Mutex<VecDeque<f32>>,
     pub out: Mutex<VecDeque<f32>>,
+    /// Audio of the Go Live stream being watched (mixed with voice).
+    pub stream_out: Mutex<VecDeque<f32>>,
     /// Mic level of the last chunk, in dBFS * -1 (so 40 = -40 dBFS), as bits of f32.
     pub mic_level: AtomicU32,
     /// Milliseconds since `epoch` when voice was last heard on the mic.
@@ -72,6 +74,7 @@ impl Shared {
         Arc::new(Self {
             mic: Mutex::new(VecDeque::with_capacity(MIC_MAX * 2)),
             out: Mutex::new(VecDeque::with_capacity(OUT_MAX * 2)),
+            stream_out: Mutex::new(VecDeque::new()),
             mic_level: AtomicU32::new(0f32.to_bits()),
             last_voice_ms: AtomicU64::new(0),
             epoch: Instant::now(),
@@ -106,6 +109,13 @@ impl Shared {
     /// Queue decoded voice (48 kHz mono i16) for playback.
     pub fn push_out(&self, pcm: &[i16]) {
         let mut o = self.out.lock();
+        o.extend(pcm.iter().map(|s| *s as f32 / 32768.0));
+        trim_with_crossfade(&mut o, OUT_MAX, OUT_TARGET);
+    }
+
+    /// Queue decoded stream audio (48 kHz mono i16).
+    pub fn push_stream_out(&self, pcm: &[i16]) {
+        let mut o = self.stream_out.lock();
         o.extend(pcm.iter().map(|s| *s as f32 / 32768.0));
         trim_with_crossfade(&mut o, OUT_MAX, OUT_TARGET);
     }
@@ -521,6 +531,8 @@ fn soft_limit(x: f32) -> f32 {
 /// a small cushion before starting, fades in, lets the sound die away if the
 /// queue runs dry, and plays 0.5% faster when audio piles up.
 struct Playout {
+    /// true = play the stream queue, false = voice.
+    stream: bool,
     rs: Converter,
     conv: VecDeque<f32>,
     tmp: Vec<f32>,
@@ -533,6 +545,7 @@ struct Playout {
 impl Playout {
     fn new(device_rate: u32) -> Self {
         Self {
+            stream: false,
             rs: Converter::new(RATE as u32, device_rate),
             conv: VecDeque::new(),
             tmp: Vec::new(),
@@ -545,7 +558,8 @@ impl Playout {
 
     fn fill(&mut self, out: &mut [f32], ch: usize, shared: &Shared, deaf: bool) {
         let frames = out.len() / ch;
-        let backlog = shared.out.lock().len();
+        let queue = if self.stream { &shared.stream_out } else { &shared.out };
+        let backlog = queue.lock().len();
         if !self.playing && backlog >= OUT_PREBUF {
             self.playing = true;
             self.fade = 0.0;
@@ -555,7 +569,7 @@ impl Playout {
             let need = ((frames - self.conv.len()) as f64 * self.rs.step()).ceil() as usize + 1;
             self.tmp.clear();
             {
-                let mut o = shared.out.lock();
+                let mut o = queue.lock();
                 let n = need.min(o.len());
                 self.tmp.extend(o.drain(..n));
             }
@@ -789,9 +803,20 @@ fn build_output(
     let cfg = sup.config();
     let ch = cfg.channels.max(1) as usize;
     let mut playout = Playout::new(cfg.sample_rate);
+    let mut stream_playout = Playout::new(cfg.sample_rate);
+    stream_playout.stream = true;
+    let mut extra: Vec<f32> = Vec::new();
     let mut fill = move |out: &mut [f32]| {
         let deaf = deafened.load(Ordering::Relaxed);
         playout.fill(out, ch, &shared, deaf);
+        // Mix in the stream being watched, if any.
+        if stream_playout.playing || stream_playout.last.abs() > 1e-4 || !shared.stream_out.lock().is_empty() {
+            extra.resize(out.len(), 0.0);
+            stream_playout.fill(&mut extra, ch, &shared, deaf);
+            for (o, e) in out.iter_mut().zip(extra.iter()) {
+                *o = (*o + *e).clamp(-1.0, 1.0);
+            }
+        }
     };
     let err = |e| eprintln!("speaker error: {e}");
     let stream = match fmt {

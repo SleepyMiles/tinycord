@@ -387,6 +387,35 @@ impl Cipher {
         Ok(())
     }
 
+    /// tinycord patch: encrypt a small hand-built RTCP packet in place for the
+    /// "_rtpsize" modes: the first `header_len` bytes are authenticated but
+    /// sent in the clear; then the tag and the 4-byte nonce counter follow.
+    #[cfg(feature = "receive")]
+    pub(crate) fn encrypt_rtcp_raw(
+        &self,
+        buf: &mut Vec<u8>,
+        header_len: usize,
+        counter: u32,
+    ) -> Result<(), CryptoError> {
+        let counter_bytes = counter.to_be_bytes();
+        let (header, body) = buf.split_at_mut(header_len);
+        let tag: Vec<u8> = match self {
+            Self::Aes256Gcm(aes_gcm) => {
+                let mut nonce = aes_gcm::Nonce::default();
+                nonce[..4].copy_from_slice(&counter_bytes);
+                aes_gcm.encrypt_in_place_detached(&nonce, header, body)?.to_vec()
+            },
+            Self::XChaCha20Poly1305(cha) => {
+                let mut nonce = chacha20poly1305::XNonce::default();
+                nonce[..4].copy_from_slice(&counter_bytes);
+                cha.encrypt_in_place_detached(&nonce, header, body)?.to_vec()
+            },
+        };
+        buf.extend_from_slice(&tag);
+        buf.extend_from_slice(&counter_bytes);
+        Ok(())
+    }
+
     #[cfg(any(feature = "receive", test))]
     pub(crate) fn decrypt_rtp_in_place(
         &self,

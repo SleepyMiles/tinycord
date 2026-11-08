@@ -3,7 +3,7 @@
 //! Text messages, presences and everything else are ignored.
 
 use crate::state::{self, state, Chan, Cmd, Guild, VoiceSt};
-use crate::{store, voice};
+use crate::{store, stream, voice};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use songbird::id::{ChannelId, GuildId, UserId};
@@ -41,6 +41,8 @@ struct Pending {
     server: Option<(String, String)>, // (token, endpoint)
     /// (session, endpoint, token, channel) we last connected with
     connected_with: Option<(String, String, String, u64)>,
+    /// Streamer to watch once voice is connected.
+    pending_watch: Option<u64>,
 }
 
 enum End {
@@ -199,7 +201,7 @@ async fn session(
             }
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return End::Reconnect };
-                command(cmd, pend, v, &mut out);
+                command(cmd, pend, v, &mut out).await;
             }
         }
         for m in out {
@@ -237,7 +239,45 @@ fn request_names(guild: u64, out: &mut Vec<Value>) {
     }
 }
 
-fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out: &mut Vec<Value>) {
+fn do_join(g: u64, c: u64, pend: &mut Pending, v: &mut Option<voice::Voice>, out: &mut Vec<Value>) {
+    let current = state().joined;
+    if let Some((og, _)) = current {
+        if og != g {
+            out.push(voice_state_payload(og, None));
+            voice::disconnect(v);
+            *pend = Pending::default();
+        }
+    }
+    pend.guild = g;
+    pend.channel = c;
+    {
+        let mut s = state();
+        s.joined = Some((g, c));
+        s.status = "Joining...".into();
+    }
+    state::changed();
+    out.push(voice_state_payload(g, Some(c)));
+    request_names(g, out);
+}
+
+async fn start_watch(g: u64, c: u64, u: u64, out: &mut Vec<Value>) {
+    if let Some(old) = stream::current_key().await {
+        out.push(json!({"op": 19, "d": {"stream_key": old}}));
+    }
+    let key = stream::key_for(g, c, u);
+    let name = state().name_of(g, u);
+    stream::begin(key.clone(), u, name).await;
+    out.push(json!({"op": 20, "d": {"stream_key": key}}));
+}
+
+async fn stop_watch(out: &mut Vec<Value>) {
+    if let Some(key) = stream::current_key().await {
+        out.push(json!({"op": 19, "d": {"stream_key": key}}));
+    }
+    stream::stop().await;
+}
+
+async fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out: &mut Vec<Value>) {
     match cmd {
         Cmd::Login(_) => {}
         Cmd::ViewGuild(g) => {
@@ -246,26 +286,28 @@ fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out: &mut
             request_names(g, out);
         }
         Cmd::Join(g, c) => {
-            let current = state().joined;
-            if let Some((og, _)) = current {
-                if og != g {
-                    out.push(voice_state_payload(og, None));
-                    voice::disconnect(v);
-                    *pend = Pending::default();
-                }
+            if state().joined != Some((g, c)) {
+                stop_watch(out).await;
             }
-            pend.guild = g;
-            pend.channel = c;
-            {
-                let mut s = state();
-                s.joined = Some((g, c));
-                s.status = "Joining...".into();
-            }
-            state::changed();
-            out.push(voice_state_payload(g, Some(c)));
-            request_names(g, out);
+            do_join(g, c, pend, v, out);
         }
+        Cmd::Watch(g, c, u) => {
+            let ready = {
+                let s = state();
+                s.joined == Some((g, c)) && s.voice_ready
+            };
+            if ready {
+                start_watch(g, c, u, out).await;
+            } else {
+                // You have to be in the channel to watch: join, then watch.
+                stop_watch(out).await;
+                do_join(g, c, pend, v, out);
+                pend.pending_watch = Some(u);
+            }
+        }
+        Cmd::StopWatch => stop_watch(out).await,
         Cmd::Leave => {
+            stop_watch(out).await;
             let current = state().joined.take();
             if let Some((g, _)) = current {
                 out.push(voice_state_payload(g, None));
@@ -321,6 +363,7 @@ fn learn_voice_state(guild: u64, vs: &Value) {
                 channel: ch,
                 mute: vs["self_mute"].as_bool().unwrap_or(false) || vs["mute"].as_bool().unwrap_or(false),
                 deaf: vs["self_deaf"].as_bool().unwrap_or(false) || vs["deaf"].as_bool().unwrap_or(false),
+                streaming: vs["self_stream"].as_bool().unwrap_or(false),
             },
         );
     }
@@ -512,17 +555,23 @@ async fn dispatch(
                 if ch == 0 {
                     // We left, or were disconnected by someone.
                     if state().joined.map(|(g, _)| g) == Some(gid) {
+                        stream::stop().await;
                         voice::disconnect(v);
                         *pend = Pending::default();
                         state().joined = None;
                         state::set_status("Disconnected from voice");
                     }
                 } else if state().joined.is_some() {
+                    if state().joined != Some((gid, ch)) {
+                        // Moved to another channel: a stream there isn't ours.
+                        stop_watch(out).await;
+                    }
                     pend.guild = gid;
                     pend.channel = ch;
                     pend.session_id = d["session_id"].as_str().map(String::from);
                     state().joined = Some((gid, ch));
                     try_voice(pend, v).await;
+                    watch_if_pending(pend, out).await;
                 }
             }
             update_known_users(pend);
@@ -537,11 +586,34 @@ async fn dispatch(
                 (Some(tok), Some(ep)) => {
                     pend.server = Some((tok.to_string(), ep.to_string()));
                     try_voice(pend, v).await;
+                    watch_if_pending(pend, out).await;
                 }
                 _ => state::set_status("Waiting for a voice server..."),
             }
         }
+        "STREAM_CREATE" | "STREAM_SERVER_UPDATE" | "STREAM_UPDATE" | "STREAM_DELETE" => {
+            tracing::info!("{t}: {}", redact(d));
+            stream::on_event(t, d, pend.session_id.clone()).await;
+        }
         _ => {}
+    }
+}
+
+/// The event without its token (for the log file).
+fn redact(d: &Value) -> Value {
+    let mut d = d.clone();
+    if d.get("token").is_some() {
+        d["token"] = json!("(hidden)");
+    }
+    d
+}
+
+async fn watch_if_pending(pend: &mut Pending, out: &mut Vec<Value>) {
+    if !state().voice_ready {
+        return;
+    }
+    if let Some(u) = pend.pending_watch.take() {
+        start_watch(pend.guild, pend.channel, u, out).await;
     }
 }
 

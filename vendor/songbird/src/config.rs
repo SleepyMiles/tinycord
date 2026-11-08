@@ -150,6 +150,10 @@ pub struct Config {
     /// [soft-clipped]: https://opus-codec.org/docs/opus_api-1.3.1/group__opus__decoder.html#gaff99598b352e8939dded08d96e125e0b
     pub use_softclip: bool,
 
+    /// tinycord patch: announce video support and pass video packets to
+    /// `video_hook::VIDEO_SINK` (used for Go Live stream connections).
+    pub video_receive: bool,
+
     #[cfg(feature = "driver")]
     /// Configures the maximum amount of time to wait for an attempted voice
     /// connection to Discord.
@@ -225,6 +229,7 @@ impl Default for Config {
             preallocated_tracks: 1,
             #[cfg(feature = "driver")]
             use_softclip: true,
+            video_receive: false,
             #[cfg(feature = "driver")]
             driver_retry: Retry::default(),
             #[cfg(feature = "driver")]
@@ -306,6 +311,13 @@ impl Config {
     #[must_use]
     pub fn use_softclip(mut self, use_softclip: bool) -> Self {
         self.use_softclip = use_softclip;
+        self
+    }
+
+    /// tinycord patch: see [`Config::video_receive`].
+    #[must_use]
+    pub fn video_receive(mut self, on: bool) -> Self {
+        self.video_receive = on;
         self
     }
 

@@ -46,6 +46,8 @@ struct UdpRx {
     udp_socket: UdpSocket,
     dave_session: Arc<RwLock<Option<davey::DaveSession>>>,
     dave_protocol_version: Arc<AtomicU16>,
+    /// tinycord patch: nonce counter for the RTCP keyframe requests we send.
+    pli_counter: u32,
 }
 
 impl UdpRx {
@@ -150,6 +152,66 @@ impl UdpRx {
         }
     }
 
+    /// tinycord patch: transport-decrypt a video packet and pass it on, then
+    /// send a keyframe request if one was asked for.
+    fn handle_video(
+        &mut self,
+        rtp: &mut discortp::rtp::MutableRtpPacket<'_>,
+        sink: crate::video_hook::VideoSink,
+    ) {
+        let raw = rtp.packet();
+        if raw.len() < 12 {
+            return;
+        }
+        let marker = raw[1] & 0x80 != 0;
+        let payload_type = raw[1] & 0x7f;
+        let seq = u16::from_be_bytes([raw[2], raw[3]]);
+        let timestamp = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        let ssrc = u32::from_be_bytes([raw[8], raw[9], raw[10], raw[11]]);
+        match self.cipher.decrypt_rtp_in_place(rtp) {
+            Ok((start, tail)) => {
+                let payload = rtp.payload();
+                let len = payload.len();
+                let tail = if rtp.get_padding() != 0 && len > tail {
+                    tail + payload[len - tail - 1] as usize
+                } else {
+                    tail
+                };
+                if start + tail <= len {
+                    let body = &payload[start..len - tail];
+                    let pkt = crate::video_hook::VideoRtp {
+                        ssrc,
+                        seq,
+                        timestamp,
+                        marker,
+                        payload_type,
+                        body,
+                    };
+                    sink(&pkt, &self.dave_session);
+                }
+            },
+            Err(e) => warn!("video RTP decryption failed: {:?}", e),
+        }
+
+        let media = crate::video_hook::PLI_REQUEST.swap(0, Ordering::Relaxed);
+        if media != 0 {
+            let sender = crate::video_hook::SELF_SSRC.load(Ordering::Relaxed);
+            // RTCP payload-specific feedback, FMT 1 = PLI, length 2 words.
+            let mut pli = vec![0x81, 206, 0x00, 0x02];
+            pli.extend_from_slice(&sender.to_be_bytes());
+            pli.extend_from_slice(&media.to_be_bytes());
+            self.pli_counter = self.pli_counter.wrapping_add(1);
+            match self.cipher.encrypt_rtcp_raw(&mut pli, 8, self.pli_counter) {
+                Ok(()) => {
+                    if let Err(e) = self.udp_socket.try_send(&pli) {
+                        warn!("keyframe request send failed: {e}");
+                    }
+                },
+                Err(e) => warn!("keyframe request encrypt failed: {e:?}"),
+            }
+        }
+    }
+
     async fn process_udp_message(&mut self, interconnect: &Interconnect, mut packet: BytesMut) {
         // NOTE: errors here (and in general for UDP) are not fatal to the connection.
         // Panics should be avoided due to adversarial nature of rx'd packets,
@@ -162,6 +224,15 @@ impl UdpRx {
 
         match demux::demux_mut(packet.as_mut()) {
             DemuxedMut::Rtp(mut rtp) => {
+                // tinycord patch: video packets go to the video sink.
+                if rtp.get_version() == RTP_VERSION && rtp.get_payload_type() != RTP_PROFILE_TYPE {
+                    let sink = crate::video_hook::VIDEO_SINK.read().ok().and_then(|g| *g);
+                    if let Some(sink) = sink {
+                        self.handle_video(&mut rtp, sink);
+                        return;
+                    }
+                }
+
                 if !rtp_valid(&rtp.to_immutable()) {
                     error!("Illegal RTP message received.");
                     return;
@@ -345,6 +416,7 @@ pub(crate) async fn runner(
         udp_socket,
         dave_session,
         dave_protocol_version,
+        pli_counter: rand::random(),
     };
 
     state.run(&mut interconnect).await;

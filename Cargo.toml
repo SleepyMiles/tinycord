@@ -1,6 +1,6 @@
 [package]
 name = "tinycord"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 
 [lints.rust]
@@ -26,6 +26,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 nnnoiseless = { version = "0.5.2", default-features = false }
 rubato = "0.16"
+openh264 = "0.9.9"
 
 [profile.release]
 opt-level = "s"

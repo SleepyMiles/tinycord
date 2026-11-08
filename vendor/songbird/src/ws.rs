@@ -32,7 +32,7 @@ use tokio_websockets::{
 use tracing::{debug, instrument};
 use url::Url;
 
-pub struct WsStream(WebSocketStream<MaybeTlsStream<TcpStream>>);
+pub struct WsStream(WebSocketStream<MaybeTlsStream<TcpStream>>, bool);
 
 impl WsStream {
     #[instrument]
@@ -56,7 +56,7 @@ impl WsStream {
             .connect()
             .await?;
 
-        Ok(Self(stream))
+        Ok(Self(stream, false))
     }
 
     pub(crate) async fn recv_event(&mut self) -> Result<Option<Event>> {
@@ -68,11 +68,21 @@ impl WsStream {
             Ok(None) | Err(_) => None,
         };
 
-        convert_ws_message(ws_message)
+        convert_ws_message(ws_message, self.1)
     }
 
     pub(crate) async fn recv_event_no_timeout(&mut self) -> Result<Option<Event>> {
-        convert_ws_message(self.0.try_next().await?)
+        convert_ws_message(self.0.try_next().await?, self.1)
+    }
+
+    /// tinycord patch: pass this connection's messages to `video_hook::WS_TAP`.
+    pub(crate) fn set_tap(&mut self, on: bool) {
+        self.1 = on;
+    }
+
+    /// tinycord patch: send a hand-written JSON message.
+    pub(crate) async fn send_raw(&mut self, text: String) -> Result<()> {
+        Ok(self.0.send(Message::text(text)).await?)
     }
 
     pub(crate) async fn send_json(&mut self, value: &Event) -> Result<()> {
@@ -139,16 +149,22 @@ impl From<BinaryError> for Error {
 }
 
 #[inline]
-pub(crate) fn convert_ws_message(message: Option<Message>) -> Result<Option<Event>> {
+pub(crate) fn convert_ws_message(message: Option<Message>, tap: bool) -> Result<Option<Event>> {
     #[cfg(feature = "tungstenite")]
     match message {
-        Some(Message::Text(ref payload)) =>
+        Some(Message::Text(ref payload)) => {
+            if tap {
+                if let Some(hook) = crate::video_hook::WS_TAP.read().ok().and_then(|g| *g) {
+                    hook(payload);
+                }
+            }
             return Ok(serde_json::from_str(payload)
                 .map_err(|e| {
                     debug!("Unexpected JSON: {e}. Payload: {payload}");
                     e
                 })
-                .ok()),
+                .ok());
+        },
         Some(Message::Binary(bytes)) => {
             return Ok(deserialize_binary_event(&bytes)
                 .map_err(|e| {

@@ -29,13 +29,15 @@ use socket2::Socket;
 use std::sync::{atomic::AtomicU16, Arc, RwLock};
 use std::{net::IpAddr, num::NonZeroU16, str::FromStr};
 use tokio::{net::UdpSocket, spawn, time::timeout};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 
 pub(crate) struct Connection {
     pub(crate) info: ConnectionInfo,
     pub(crate) ssrc: u32,
     pub(crate) ws: Sender<WsMessage>,
+    /// tinycord patch: this is a video (Go Live) connection.
+    pub(crate) video: bool,
 }
 
 impl Connection {
@@ -70,15 +72,34 @@ impl Connection {
         let mut hello = None;
         let mut ready = None;
 
-        client
-            .send_json(&GatewayEvent::from(Identify {
-                server_id: info.guild_id.into(),
-                session_id: info.session_id.clone(),
-                token: info.token.clone(),
-                user_id: info.user_id.into(),
-                max_dave_protocol_version: Some(davey::DAVE_PROTOCOL_VERSION),
-            }))
-            .await?;
+        if config.video_receive {
+            // tinycord patch: a viewer-only video connection. Same as a voice
+            // identify, plus "this client handles video".
+            client.set_tap(true);
+            let identify = serde_json::json!({
+                "op": 0,
+                "d": {
+                    "server_id": info.guild_id.0.to_string(),
+                    "session_id": info.session_id,
+                    "token": info.token,
+                    "user_id": info.user_id.0.to_string(),
+                    "max_dave_protocol_version": davey::DAVE_PROTOCOL_VERSION,
+                    "video": true,
+                    "streams": [{"type": "video", "rid": "100", "quality": 100}],
+                }
+            });
+            client.send_raw(identify.to_string()).await?;
+        } else {
+            client
+                .send_json(&GatewayEvent::from(Identify {
+                    server_id: info.guild_id.into(),
+                    session_id: info.session_id.clone(),
+                    token: info.token.clone(),
+                    user_id: info.user_id.into(),
+                    max_dave_protocol_version: Some(davey::DAVE_PROTOCOL_VERSION),
+                }))
+                .await?;
+        }
 
         loop {
             let Some(value) = client.recv_event().await? else {
@@ -121,6 +142,18 @@ impl Connection {
         );
 
         let udp = UdpSocket::bind("0.0.0.0:0").await?;
+
+        // tinycord patch: a keyframe arrives as a burst of ~100+ packets; a
+        // small OS receive buffer drops some and the picture can't start.
+        let udp = if config.video_receive {
+            let socket = Socket::from(udp.into_std()?);
+            if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
+                warn!("could not enlarge UDP receive buffer: {e}");
+            }
+            UdpSocket::from_std(socket.into())?
+        } else {
+            udp
+        };
 
         // Optimisation for non-receive case: set rx buffer size to zero.
         let udp = if cfg!(feature = "receive") {
@@ -174,20 +207,50 @@ impl Connection {
 
             let address = IpAddr::from_str(address_str).map_err(|_| Error::IllegalIp)?;
 
-            client
-                .send_json(&GatewayEvent::from(SelectProtocol {
-                    protocol: "udp".into(),
-                    data: ProtocolData {
-                        address,
-                        mode: chosen_crypto.to_request_str().into(),
-                        port: view.get_port(),
-                    },
-                }))
-                .await?;
+            if config.video_receive {
+                crate::video_hook::SELF_SSRC
+                    .store(ready.ssrc, std::sync::atomic::Ordering::Relaxed);
+                // tinycord patch: offer Opus + H.264 (decode only).
+                let select = serde_json::json!({
+                    "op": 1,
+                    "d": {
+                        "protocol": "udp",
+                        "data": {
+                            "address": address.to_string(),
+                            "port": view.get_port(),
+                            "mode": chosen_crypto.to_request_str(),
+                        },
+                        "codecs": [
+                            {"name": "opus", "type": "audio", "priority": 1000, "payload_type": 120},
+                            {"name": "H264", "type": "video", "priority": 1000, "payload_type": 103,
+                             "rtx_payload_type": 104, "encode": false, "decode": true},
+                        ],
+                    }
+                });
+                client.send_raw(select.to_string()).await?;
+            } else {
+                client
+                    .send_json(&GatewayEvent::from(SelectProtocol {
+                        protocol: "udp".into(),
+                        data: ProtocolData {
+                            address,
+                            mode: chosen_crypto.to_request_str().into(),
+                            port: view.get_port(),
+                        },
+                    }))
+                    .await?;
+            }
         }
 
         let (cipher, dave_session, dave_protocol_version) =
             init_cipher(&mut client, &info, chosen_crypto, &ws_msg_tx).await?;
+
+        if config.video_receive {
+            // tinycord patch: ask the server to send us video at full quality.
+            client
+                .send_raw(serde_json::json!({"op": 15, "d": {"any": 100}}).to_string())
+                .await?;
+        }
         let dave_session = Arc::new(RwLock::new(dave_session));
         let dave_protocol_version = Arc::new(dave_protocol_version);
 
@@ -278,6 +341,7 @@ impl Connection {
             info,
             ssrc,
             ws: ws_msg_tx,
+            video: config.video_receive,
         })
     }
 
@@ -297,6 +361,7 @@ impl Connection {
         // Thread may have died, we want to send to prompt a clean exit
         // (if at all possible) and then proceed as normal.
         let mut client = WsStream::connect(url).await?;
+        client.set_tap(self.video);
 
         client
             .send_json(&GatewayEvent::from(Resume {

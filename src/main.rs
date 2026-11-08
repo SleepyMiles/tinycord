@@ -4,8 +4,10 @@ mod audio;
 mod gateway;
 mod state;
 mod store;
+mod stream;
 #[cfg(any(windows, wincheck))]
 mod ui;
+mod video;
 mod voice;
 
 fn init_log() {

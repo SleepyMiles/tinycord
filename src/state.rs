@@ -28,6 +28,16 @@ pub struct VoiceSt {
     pub channel: u64,
     pub mute: bool,
     pub deaf: bool,
+    /// Sharing their screen with Go Live.
+    pub streaming: bool,
+}
+
+/// The stream we're watching.
+#[derive(Clone, Debug)]
+pub struct Watching {
+    pub user: u64,
+    pub name: String,
+    pub status: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +60,7 @@ pub struct State {
     pub nicks: HashMap<(u64, u64), String>,
     /// the channel we asked to be in
     pub joined: Option<(u64, u64)>,
+    pub watching: Option<Watching>,
     pub voice_ready: bool,
     pub speaking: HashSet<u64>,
     pub self_talking: bool,
@@ -119,6 +130,7 @@ fn cell() -> &'static Mutex<State> {
             names: HashMap::new(),
             nicks: HashMap::new(),
             joined: None,
+            watching: None,
             voice_ready: false,
             speaking: HashSet::new(),
             self_talking: false,
@@ -148,6 +160,9 @@ pub enum Cmd {
     Leave,
     UpdateSelf,
     RestartAudio,
+    /// Watch (guild, channel, streamer)'s Go Live stream.
+    Watch(u64, u64, u64),
+    StopWatch,
 }
 
 static CMD: OnceLock<UnboundedSender<Cmd>> = OnceLock::new();

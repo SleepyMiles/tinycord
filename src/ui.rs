@@ -66,6 +66,7 @@ struct Row {
     talking: bool,
     dim: bool,
     here: bool,
+    live: bool,
 }
 
 struct Ui {
@@ -211,6 +212,24 @@ pub fn run() {
             lpszClassName: sl_cls.as_ptr(),
         };
         RegisterClassW(&wc3);
+
+        let view_cls = wide("tinycord_view");
+        let wc4 = WNDCLASSW {
+            style: CS_DBLCLKS,
+            lpfnWndProc: Some(view_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: LoadIconW(null_mut(), IDI_APPLICATION),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: view_cls.as_ptr(),
+        };
+        RegisterClassW(&wc4);
+        if let Ok(mut f) = crate::video::ON_FRAME.write() {
+            *f = Some(view_repaint);
+        }
 
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
@@ -470,8 +489,11 @@ unsafe fn on_command(id: i32, code: u32) {
             }
         }
         (ID_LIST, LBN_DBLCLK) => join_selected(),
+        (ID_LIST, LBN_SELCHANGE) => state::changed(),
         (ID_JOIN, BN_CLICKED) => {
-            if state().joined.is_some() {
+            if selected_live() {
+                join_selected();
+            } else if state().joined.is_some() {
                 state::send(Cmd::Leave);
             } else {
                 join_selected();
@@ -592,6 +614,17 @@ unsafe fn mic_meter(hwnd: HWND) {
     set_text(hwnd, &title);
 }
 
+/// Is the selected row someone else who is streaming?
+unsafe fn selected_live() -> bool {
+    let Some((lb, rows)) = with_ui(|u| (u.c[4], u.rows.clone())) else { return false };
+    let i = SendMessageW(lb, LB_GETCURSEL, 0, 0);
+    let me = state().me;
+    i >= 0
+        && rows
+            .get(i as usize)
+            .is_some_and(|r| r.kind == RowKind::Member && r.live && r.id != me)
+}
+
 unsafe fn join_selected() {
     let Some((lb, rows)) = with_ui(|u| (u.c[4], u.rows.clone())) else { return };
     let i = SendMessageW(lb, LB_GETCURSEL, 0, 0);
@@ -601,7 +634,11 @@ unsafe fn join_selected() {
     let Some(row) = rows.get(i as usize) else { return };
     let g = state().selected_guild;
     if g != 0 && row.channel != 0 {
-        state::send(Cmd::Join(g, row.channel));
+        if row.kind == RowKind::Member && row.live && row.id != state().me {
+            state::send(Cmd::Watch(g, row.channel, row.id));
+        } else {
+            state::send(Cmd::Join(g, row.channel));
+        }
     }
 }
 
@@ -654,6 +691,7 @@ fn build_rows() -> Vec<Row> {
             talking: false,
             dim: false,
             here,
+            live: false,
         });
         for (uid, name, vs) in s.members_of(g, ch.id) {
             let mut text = name;
@@ -670,6 +708,7 @@ fn build_rows() -> Vec<Row> {
                 talking: s.is_speaking(uid),
                 dim: vs.mute || vs.deaf,
                 here,
+                live: vs.streaming,
             });
         }
     }
@@ -761,7 +800,7 @@ unsafe fn refresh() {
         InvalidateRect(lb, null(), 0);
     }
 
-    set_text(c[5], if joined { "Leave" } else { "Join" });
+    set_text(c[5], if selected_live() { "Watch" } else if joined { "Leave" } else { "Join" });
     SendMessageW(c[6], BM_SETCHECK, muted as usize, 0);
     SendMessageW(c[7], BM_SETCHECK, deaf as usize, 0);
     set_text(c[9], &key_txt);
@@ -771,6 +810,7 @@ unsafe fn refresh() {
     InvalidateRect(c[19], null(), 0);
 
     update_overlay();
+    update_viewer();
 }
 
 unsafe fn update_devices(c: &[HWND; 20]) {
@@ -860,6 +900,40 @@ unsafe fn draw_item(di: &DRAWITEMSTRUCT) {
                 },
             );
             rc.left = x + d + sc(dpi, 6);
+            if row.live {
+                // Red "LIVE" tag on the right, like Discord.
+                let (tw, th) = (sc(dpi, 32), sc(dpi, 14));
+                let tr = RECT {
+                    left: rc.right - tw - sc(dpi, 6),
+                    top: (rc.top + rc.bottom - th) / 2,
+                    right: rc.right - sc(dpi, 6),
+                    bottom: (rc.top + rc.bottom + th) / 2,
+                };
+                let red = CreateSolidBrush(rgb(237, 66, 69));
+                let ob = SelectObject(hdc, red as _);
+                let op = SelectObject(hdc, GetStockObject(NULL_PEN));
+                RoundRect(hdc, tr.left, tr.top, tr.right + 1, tr.bottom + 1, sc(dpi, 6), sc(dpi, 6));
+                SelectObject(hdc, ob);
+                SelectObject(hdc, op);
+                DeleteObject(red as _);
+                SelectObject(hdc, bold as _);
+                SetTextColor(hdc, rgb(255, 255, 255));
+                let mut tr2 = tr;
+                let t = wide("LIVE");
+                DrawTextW(hdc, t.as_ptr(), -1, &mut tr2, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+                rc.right = tr.left - sc(dpi, 4);
+                SelectObject(hdc, if row.talking { bold } else { font } as _);
+                SetTextColor(
+                    hdc,
+                    if row.talking {
+                        rgb(20, 150, 60)
+                    } else if row.dim {
+                        rgb(140, 140, 140)
+                    } else {
+                        rgb(30, 30, 30)
+                    },
+                );
+            }
             let t = wide(&row.text);
             DrawTextW(hdc, t.as_ptr(), -1, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
         }
@@ -997,6 +1071,205 @@ unsafe extern "system" fn slider_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             DeleteObject(bmp as _);
             DeleteDC(mem);
             EndPaint(hwnd, &ps);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stream viewer window
+// ---------------------------------------------------------------------------
+
+static VIEW_HWND: std::sync::atomic::AtomicPtr<core::ffi::c_void> =
+    std::sync::atomic::AtomicPtr::new(null_mut());
+
+thread_local! {
+    /// Saved placement while the viewer is fullscreen.
+    static VIEW_FULL: std::cell::Cell<Option<WINDOWPLACEMENT>> = const { std::cell::Cell::new(None) };
+    static VIEW_TOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Called from the video thread when a new picture is ready.
+fn view_repaint() {
+    let h = VIEW_HWND.load(Ordering::Acquire);
+    if !h.is_null() {
+        unsafe { InvalidateRect(h, null(), 0) };
+    }
+}
+
+/// Open or close the viewer to match `state().watching`.
+unsafe fn update_viewer() {
+    let watching = state().watching.clone();
+    let h = VIEW_HWND.load(Ordering::Acquire);
+    match (watching, h.is_null()) {
+        (Some(w), true) => {
+            let dpi = with_ui(|u| u.dpi).unwrap_or(96);
+            let style = WS_OVERLAPPEDWINDOW;
+            let mut r = RECT { left: 0, top: 0, right: sc(dpi, 960), bottom: sc(dpi, 540) };
+            AdjustWindowRect(&mut r, style, 0);
+            let cls = wide("tinycord_view");
+            let title = wide(&format!("Watching {}", w.name));
+            let hwnd = CreateWindowExW(
+                0,
+                cls.as_ptr(),
+                title.as_ptr(),
+                style,
+                CW_USEDEFAULT,
+                CW_USEDEFAULT,
+                r.right - r.left,
+                r.bottom - r.top,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            VIEW_HWND.store(hwnd, Ordering::Release);
+            ShowWindow(hwnd, SW_SHOW);
+        }
+        (None, false) => {
+            VIEW_HWND.store(null_mut(), Ordering::Release);
+            DestroyWindow(h);
+        }
+        (Some(_), false) => {
+            InvalidateRect(h, null(), 0);
+        }
+        (None, true) => {}
+    }
+}
+
+unsafe fn toggle_fullscreen(hwnd: HWND) {
+    if let Some(wp) = VIEW_FULL.with(|f| f.take()) {
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as isize);
+        SetWindowPlacement(hwnd, &wp);
+        let after = if VIEW_TOP.with(|t| t.get()) { HWND_TOPMOST } else { HWND_NOTOPMOST };
+        SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+    } else {
+        let mut wp: WINDOWPLACEMENT = std::mem::zeroed();
+        wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+        GetWindowPlacement(hwnd, &mut wp);
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        GetMonitorInfoW(mon, &mut mi);
+        VIEW_FULL.with(|f| f.set(Some(wp)));
+        SetWindowLongPtrW(hwnd, GWL_STYLE, (WS_POPUP | WS_VISIBLE) as isize);
+        let m = mi.rcMonitor;
+        SetWindowPos(hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED);
+    }
+}
+
+unsafe extern "system" fn view_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_SIZE => {
+            let w = (lp & 0xFFFF) as u32;
+            let h = ((lp >> 16) & 0xFFFF) as u32;
+            if w > 0 && h > 0 {
+                crate::video::TARGET_W.store(w, Ordering::Relaxed);
+                crate::video::TARGET_H.store(h, Ordering::Relaxed);
+            }
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_ERASEBKGND => 1,
+        WM_LBUTTONDBLCLK => {
+            toggle_fullscreen(hwnd);
+            0
+        }
+        WM_KEYDOWN => {
+            match wp as u32 {
+                0x1B => {
+                    // Esc leaves fullscreen.
+                    let full = VIEW_FULL.with(|f| {
+                        let v = f.take();
+                        let some = v.is_some();
+                        f.set(v);
+                        some
+                    });
+                    if full {
+                        toggle_fullscreen(hwnd);
+                    }
+                }
+                0x7A => toggle_fullscreen(hwnd), // F11
+                0x54 => {
+                    // T: keep on top
+                    let on = !VIEW_TOP.with(|t| t.get());
+                    VIEW_TOP.with(|t| t.set(on));
+                    let after = if on { HWND_TOPMOST } else { HWND_NOTOPMOST };
+                    SetWindowPos(hwnd, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_PAINT => {
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let black = GetStockObject(BLACK_BRUSH) as HBRUSH;
+            let pic = crate::video::rendered().lock();
+            let status = crate::video::info().lock().1.clone();
+            if pic.w > 0 && !pic.px.is_empty() {
+                let (w, h) = (pic.w as i32, pic.h as i32);
+                let x0 = ((rc.right - w) / 2).max(0);
+                let y0 = ((rc.bottom - h) / 2).max(0);
+                // Black bars around the picture.
+                for r in [
+                    RECT { left: 0, top: 0, right: rc.right, bottom: y0 },
+                    RECT { left: 0, top: y0 + h, right: rc.right, bottom: rc.bottom },
+                    RECT { left: 0, top: y0, right: x0, bottom: y0 + h },
+                    RECT { left: x0 + w, top: y0, right: rc.right, bottom: y0 + h },
+                ] {
+                    if r.right > r.left && r.bottom > r.top {
+                        FillRect(hdc, &r, black);
+                    }
+                }
+                let mut bi: BITMAPINFO = std::mem::zeroed();
+                bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+                bi.bmiHeader.biWidth = w;
+                bi.bmiHeader.biHeight = -h; // top-down
+                bi.bmiHeader.biPlanes = 1;
+                bi.bmiHeader.biBitCount = 32;
+                bi.bmiHeader.biCompression = BI_RGB;
+                SetDIBitsToDevice(
+                    hdc,
+                    x0,
+                    y0,
+                    w as u32,
+                    h as u32,
+                    0,
+                    0,
+                    0,
+                    h as u32,
+                    pic.px.as_ptr() as *const _,
+                    &bi,
+                    DIB_RGB_COLORS,
+                );
+            } else {
+                FillRect(hdc, &rc, black);
+            }
+            drop(pic);
+            if !status.is_empty() {
+                let (dpi, font) = with_ui(|u| (u.dpi, u.ofont)).unwrap_or((96, null_mut()));
+                SelectObject(hdc, font as _);
+                SetBkMode(hdc, TRANSPARENT as i32);
+                SetTextColor(hdc, rgb(220, 220, 225));
+                let mut tr = RECT { left: sc(dpi, 12), top: sc(dpi, 10), right: rc.right - sc(dpi, 12), bottom: rc.bottom };
+                let t = wide(&status);
+                DrawTextW(hdc, t.as_ptr(), -1, &mut tr, DT_WORDBREAK | DT_NOPREFIX);
+            }
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_CLOSE => {
+            // Close right away; the network side catches up.
+            state().watching = None;
+            state::send(Cmd::StopWatch);
+            VIEW_HWND.store(null_mut(), Ordering::Release);
+            VIEW_FULL.with(|f| f.set(None));
+            DestroyWindow(hwnd);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),

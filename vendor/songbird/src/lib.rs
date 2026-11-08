@@ -90,6 +90,37 @@ pub mod constants;
 pub static EXTRA_RECOGNIZED_USERS: std::sync::RwLock<Vec<u64>> = std::sync::RwLock::new(Vec::new());
 #[cfg(feature = "driver")]
 pub mod driver;
+
+/// tinycord patch: receiving Go Live video on a connection made with
+/// `Config::video_receive(true)`.
+#[allow(missing_docs)]
+pub mod video_hook {
+    pub use davey;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::RwLock;
+
+    /// One transport-decrypted video RTP packet (still DAVE-encrypted).
+    pub struct VideoRtp<'a> {
+        pub ssrc: u32,
+        pub seq: u16,
+        pub timestamp: u32,
+        pub marker: bool,
+        pub payload_type: u8,
+        /// RTP payload with header extensions and padding removed.
+        pub body: &'a [u8],
+    }
+
+    pub type VideoSink = fn(&VideoRtp<'_>, &RwLock<Option<davey::DaveSession>>);
+
+    /// Called for every non-Opus RTP packet on a video connection.
+    pub static VIDEO_SINK: RwLock<Option<VideoSink>> = RwLock::new(None);
+    /// Called with every text message on a video connection's voice websocket.
+    pub static WS_TAP: RwLock<Option<fn(&str)>> = RwLock::new(None);
+    /// Set to a media SSRC to send one RTCP PLI (keyframe request); 0 = none.
+    pub static PLI_REQUEST: AtomicU32 = AtomicU32::new(0);
+    /// Our SSRC on the video connection (RTCP sender SSRC).
+    pub static SELF_SSRC: AtomicU32 = AtomicU32::new(0);
+}
 pub mod error;
 #[cfg(feature = "driver")]
 pub mod events;
