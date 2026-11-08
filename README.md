@@ -93,6 +93,48 @@ the game.
   is dropped instead of playing late.
 - Mic audio waiting to be sent is capped at 60 ms.
 
+## Build it yourself (Windows 11)
+
+One-time setup:
+
+1. **Rust + Microsoft C++ tools:** download `rustup-init.exe` from
+   <https://rustup.rs> and run it. When it says the Visual Studio
+   prerequisites are missing, pick **1) Quick install via the Visual Studio
+   Community installer**, let that finish, then press Enter for the default
+   Rust install.
+2. **Git, CMake, NASM** (PowerShell):
+   ```powershell
+   winget install -e --id Git.Git
+   winget install -e --id Kitware.CMake
+   winget install -e --id NASM.NASM
+   ```
+3. Open a **new** PowerShell and check: `cargo --version`, `git --version`,
+   `cmake --version`, `Test-Path "C:\Program Files\NASM\nasm.exe"`.
+4. Get the code:
+   ```powershell
+   cd $HOME\Documents
+   git clone https://github.com/SleepyMiles/tinycord.git
+   cd tinycord
+   ```
+
+Build (run these in the `tinycord` folder, in each new PowerShell window):
+
+```powershell
+$env:OPUS_BUNDLED = "1"
+$env:OPUS_STATIC = "1"
+$env:NASM = "C:\Program Files\NASM\nasm.exe"
+cargo build --release
+```
+
+The result is `target\release\tinycord.exe`. The first build compiles
+everything and takes a while; later builds only redo what changed. To get
+the newest code: `git pull`, then build again.
+
+- `OPUS_BUNDLED` / `OPUS_STATIC`: build the Opus audio codec from source and
+  put it inside the .exe (needs CMake).
+- `NASM`: lets the Go Live video encoder use its fast assembly code. Without
+  it the build still works, but screen sharing uses more CPU.
+
 ## How it's built
 
 - Rust, plain Win32 UI (`windows-sys`), audio via `cpal`.
