@@ -29,6 +29,14 @@ jobs:
           prefix-key: "v1-nasm"
       - name: Build
         run: cargo build --release
+      - name: Check the video encoder was built with NASM
+        shell: bash
+        run: |
+          out=$(cat target/release/build/openh264-sys2-*/output)
+          if echo "$out" | grep -qiE "not using any assembly|NASM compilation disabled"; then
+            echo "$out"; echo "OpenH264 was built WITHOUT assembly"; exit 1
+          fi
+          echo "OpenH264 built with NASM assembly"
       - name: Size
         shell: bash
         run: ls -l target/release/tinycord.exe
