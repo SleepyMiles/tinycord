@@ -38,7 +38,7 @@ pub fn allowed(premium: u8, boost: u8) -> (u32, u32) {
     let user = match premium {
         2 => (0, 60),
         1 | 3 => (1080, 60),
-        _ => (720, 30),
+        _ => (1080, 60),
     };
     let server = match boost {
         0 => (720, 30),
