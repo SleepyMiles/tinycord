@@ -47,7 +47,8 @@ pub fn load_settings() {
                 }
             }
             "ptt_key" => s.ptt_key = v.trim().parse().unwrap_or(0),
-            "overlay" => s.overlay = v.trim().parse().unwrap_or(2).min(4),
+            "overlay" => s.overlay = v.trim().parse().unwrap_or(2).min(crate::state::OVERLAY_MAX),
+            "on_top" => s.keep_on_top = v.trim() == "1",
             "speakers_only" => s.overlay_speakers_only = v.trim() == "1",
             "guild" => s.selected_guild = v.trim().parse().unwrap_or(0),
             "mic" => {
@@ -107,7 +108,7 @@ pub fn save_settings() {
         crate::voice::shared().vad_db.load(std::sync::atomic::Ordering::Relaxed),
     );
     let text = format!(
-        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\nns_strength={}\nclarity={}\nstream_volume={}\nstream_pin={}\nlive_monitor={}\nlive_res={}\nlive_fps={}\nlive_sound={}\n",
+        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\nns_strength={}\nclarity={}\nstream_volume={}\nstream_pin={}\nlive_monitor={}\nlive_res={}\nlive_fps={}\nlive_sound={}\non_top={}\n",
         match s.mode {
             MicMode::Open => "open",
             MicMode::Voice => "voice",
@@ -131,6 +132,7 @@ pub fn save_settings() {
         s.live_cfg.height,
         s.live_cfg.fps,
         s.live_cfg.sound as u8,
+        s.keep_on_top as u8,
     );
     drop(s);
     let _ = std::fs::write(dir().join("settings.txt"), text);
@@ -195,4 +197,47 @@ fn protect(data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(not(any(windows, wincheck)))]
 fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
     Some(data.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::LiveCfg;
+
+    /// Every setting comes back the way it was saved.
+    #[test]
+    fn settings_round_trip() {
+        let tmp = std::env::temp_dir().join(format!("tinycord-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("APPDATA", &tmp);
+        let cfg = LiveCfg { monitor: 1, height: 1080, fps: 60, sound: false };
+        for overlay in 0..=crate::state::OVERLAY_MAX {
+            {
+                let mut s = state();
+                s.overlay = overlay;
+                s.overlay_speakers_only = true;
+                s.keep_on_top = true;
+                s.mode = MicMode::Ptt;
+                s.ptt_key = 5;
+                s.live_cfg = cfg;
+            }
+            save_settings();
+            {
+                let mut s = state();
+                s.overlay = 2;
+                s.overlay_speakers_only = false;
+                s.keep_on_top = false;
+                s.mode = MicMode::Voice;
+                s.ptt_key = 0;
+                s.live_cfg = LiveCfg::default();
+            }
+            load_settings();
+            let s = state();
+            assert_eq!(s.overlay, overlay, "overlay position");
+            assert!(s.overlay_speakers_only && s.keep_on_top);
+            assert_eq!((s.mode, s.ptt_key), (MicMode::Ptt, 5));
+            assert_eq!(s.live_cfg, cfg);
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

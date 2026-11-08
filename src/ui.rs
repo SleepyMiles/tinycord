@@ -39,6 +39,7 @@ const ID_SPKDEV: i32 = 117;
 const ID_VOL: i32 = 118;
 const ID_NSLVL: i32 = 119;
 const ID_LIVE: i32 = 120;
+const ID_LOGOUT: i32 = 121;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_TOPMOST: usize = 2;
@@ -73,7 +74,7 @@ struct Row {
 struct Ui {
     hwnd: HWND,
     overlay: HWND,
-    c: [HWND; 21],
+    c: [HWND; 22],
     font: HFONT,
     bold: HFONT,
     ofont: HFONT,
@@ -242,7 +243,7 @@ pub fn run() {
             *u.borrow_mut() = Some(Ui {
                 hwnd: null_mut(),
                 overlay: null_mut(),
-                c: [null_mut(); 21],
+                c: [null_mut(); 22],
                 font: make_font(dpi, 9, FW_NORMAL as i32),
                 bold: make_font(dpi, 9, FW_BOLD as i32),
                 ofont: make_font(dpi, 11, FW_SEMIBOLD as i32),
@@ -293,6 +294,10 @@ pub fn run() {
         SetLayeredWindowAttributes(overlay, 0, 210, LWA_ALPHA);
         with_ui(|u| u.overlay = overlay);
 
+        if state().keep_on_top {
+            with_ui(|u| u.keep_on_top = true);
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        }
         ShowWindow(hwnd, SW_SHOW);
         SetTimer(hwnd, TIMER_REFRESH, 50, None);
         SetTimer(hwnd, TIMER_TOPMOST, 2000, None);
@@ -361,11 +366,12 @@ unsafe fn create_controls(hwnd: HWND) {
     let cbo = |x, y, w, id| {
         child(hwnd, "COMBOBOX", "", ts | WS_VSCROLL | CBS_DROPDOWNLIST as u32, x, y, w, 300, id, dpi, font)
     };
-    let mut c = [null_mut(); 21];
+    let mut c = [null_mut(); 22];
     c[0] = child(hwnd, "STATIC", "Starting...", SS_LEFT as u32 | SS_ENDELLIPSIS as u32, 6, 6, 268, 18, ID_STATUS, dpi, font);
     c[1] = child(hwnd, "EDIT", "", ts | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32, 6, 28, 190, 24, ID_TOKEN, dpi, font);
     c[2] = b("Log in", BS_PUSHBUTTON, 202, 28, 72, 24, ID_LOGIN);
-    c[3] = cbo(6, 28, 268, ID_GUILD);
+    c[3] = cbo(6, 28, 190, ID_GUILD);
+    c[21] = b("Log out", BS_PUSHBUTTON, 202, 28, 72, 24, ID_LOGOUT);
     c[4] = child(
         hwnd,
         "LISTBOX",
@@ -410,6 +416,7 @@ unsafe fn create_controls(hwnd: HWND) {
     SendMessageW(c[8], CB_SETCURSEL, mode_idx, 0);
     SendMessageW(c[11], CB_SETCURSEL, s.overlay as usize, 0);
     SendMessageW(c[12], BM_SETCHECK, s.overlay_speakers_only as usize, 0);
+    SendMessageW(c[13], BM_SETCHECK, s.keep_on_top as usize, 0);
     drop(s);
     let sh = crate::voice::shared();
     SendMessageW(c[14], BM_SETCHECK, sh.clarity.load(Ordering::Relaxed) as usize, 0);
@@ -542,7 +549,7 @@ unsafe fn on_command(id: i32, code: u32) {
         }
         (ID_OVERLAY, CBN_SELCHANGE) => {
             let i = SendMessageW(c[11], CB_GETCURSEL, 0, 0);
-            state().overlay = i.clamp(0, 5) as u8;
+            state().overlay = i.clamp(0, state::OVERLAY_MAX as isize) as u8;
             store::save_settings();
             with_ui(|u| u.overlay_lines.clear());
             state::changed();
@@ -587,8 +594,19 @@ unsafe fn on_command(id: i32, code: u32) {
             store::save_settings();
             state::send(Cmd::RestartAudio);
         }
+        (ID_LOGOUT, BN_CLICKED) => {
+            let Some(h) = with_ui(|u| u.hwnd) else { return };
+            let text = wide("Log out of this Discord account?\n\nYou'll need to paste a token to log in again.");
+            let title = wide("tinycord");
+            if MessageBoxW(h, text.as_ptr(), title.as_ptr(), MB_YESNO | MB_ICONQUESTION) == IDYES {
+                state::set_status("Logging out...");
+                state::send(Cmd::Logout);
+            }
+        }
         (ID_TOP, BN_CLICKED) => {
             let on = SendMessageW(c[13], BM_GETCHECK, 0, 0) == 1;
+            state().keep_on_top = on;
+            store::save_settings();
             if let Some(h) = with_ui(|u| {
                 u.keep_on_top = on;
                 u.hwnd
@@ -777,6 +795,7 @@ unsafe fn refresh() {
         ShowWindow(c[1], a);
         ShowWindow(c[2], a);
         ShowWindow(c[3], b);
+        ShowWindow(c[21], b);
         with_ui(|u| u.logged_in_shown = Some(logged_in));
     }
     if guilds != cached_guilds {
@@ -835,7 +854,7 @@ unsafe fn refresh() {
     crate::ui_live::update();
 }
 
-unsafe fn update_devices(c: &[HWND; 21]) {
+unsafe fn update_devices(c: &[HWND; 22]) {
     let (ins, outs, mic, spk) = {
         let s = state();
         (s.input_devices.clone(), s.output_devices.clone(), s.mic_device.clone(), s.spk_device.clone())

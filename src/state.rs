@@ -110,8 +110,11 @@ pub struct State {
     pub mode: MicMode,
     pub ptt_key: u32,
     pub capturing_key: bool,
-    /// 0 = off, 1 top-left, 2 top-right, 3 bottom-left, 4 bottom-right
+    /// 0 = off, 1 top-left, 2 top-right, 3 bottom-left, 4 bottom-right,
+    /// 5 left-middle (OVERLAY_MAX)
     pub overlay: u8,
+    /// Main window stays on top of other windows.
+    pub keep_on_top: bool,
     pub overlay_speakers_only: bool,
     pub selected_guild: u64,
     /// Chosen devices by name; None = Windows default.
@@ -184,6 +187,7 @@ fn cell() -> &'static Mutex<State> {
             ptt_key: 0,
             capturing_key: false,
             overlay: 2,
+            keep_on_top: false,
             overlay_speakers_only: false,
             selected_guild: 0,
             mic_device: None,
@@ -210,7 +214,12 @@ pub enum Cmd {
     /// Share your screen in the channel you're in (or apply new settings).
     GoLive(LiveCfg),
     StopLive,
+    /// Leave voice, disconnect and forget the saved token.
+    Logout,
 }
+
+/// Highest overlay position number (see `State::overlay`).
+pub const OVERLAY_MAX: u8 = 5;
 
 static CMD: OnceLock<UnboundedSender<Cmd>> = OnceLock::new();
 

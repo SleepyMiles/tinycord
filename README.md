@@ -21,7 +21,8 @@ and doesn't need an installer.
 3. Pick a server, then **double-click a voice channel** (or select it and press
    **Join**).
 
-To log out, delete `%APPDATA%\tinycord\token.bin`.
+To log out or switch accounts, press **Log out** (next to the server list).
+It leaves voice, disconnects, and deletes the saved token.
 
 ## Controls
 
@@ -32,6 +33,7 @@ To log out, delete `%APPDATA%\tinycord\token.bin`.
 - **Overlay**: where the speaker list sits. **Speakers only** hides people who
   aren't talking.
 - **Keep on top**: pins the main window too.
+- All of these settings are remembered between restarts.
 
 ## Watching a screen share (Go Live)
 

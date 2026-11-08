@@ -49,6 +49,27 @@ enum End {
     Reconnect,
     Fresh,
     AuthFailed,
+    LoggedOut,
+}
+
+/// Forget everything about the account that was logged in.
+fn forget_account(v: &mut Option<voice::Voice>, pend: &mut Pending) {
+    voice::disconnect(v);
+    voice::set_known_users(Vec::new());
+    *pend = Pending::default();
+    let mut s = state();
+    s.joined = None;
+    s.voice_ready = false;
+    s.logged_in = false;
+    s.me = 0;
+    s.premium = 0;
+    s.guilds.clear();
+    s.voice.clear();
+    s.names.clear();
+    s.nicks.clear();
+    s.speaking.clear();
+    drop(s);
+    state::changed();
 }
 
 pub async fn run(mut rx: UnboundedReceiver<Cmd>) {
@@ -56,13 +77,14 @@ pub async fn run(mut rx: UnboundedReceiver<Cmd>) {
     let mut sess = Session::default();
     let mut pend = Pending::default();
     let mut v: Option<voice::Voice> = None;
+    let mut note: Option<&str> = None;
 
     loop {
         let Some(tok) = token.clone() else {
             {
                 let mut s = state();
                 s.logged_in = false;
-                s.status = "Paste your Discord token, then press Log in".into();
+                s.status = note.take().unwrap_or("Paste your Discord token, then press Log in").into();
             }
             state::changed();
             // Wait for a login; ignore everything else until then.
@@ -96,10 +118,15 @@ pub async fn run(mut rx: UnboundedReceiver<Cmd>) {
                 store::clear_token();
                 token = None;
                 sess = Session::default();
-                voice::disconnect(&mut v);
-                pend = Pending::default();
-                state().joined = None;
-                state::set_status("Token was rejected. Paste a new one.");
+                forget_account(&mut v, &mut pend);
+                note = Some("Token was rejected. Paste a new one.");
+            }
+            End::LoggedOut => {
+                store::clear_token();
+                token = None;
+                sess = Session::default();
+                forget_account(&mut v, &mut pend);
+                note = Some("Logged out. Paste a token to log in.");
             }
         }
     }
@@ -201,6 +228,15 @@ async fn session(
             }
             cmd = rx.recv() => {
                 let Some(cmd) = cmd else { return End::Reconnect };
+                if matches!(cmd, Cmd::Logout) {
+                    // Leave voice and end streams first, then hang up.
+                    command(Cmd::Leave, pend, v, &mut out).await;
+                    for m in out {
+                        let _ = ws.send(Message::Text(m.to_string().into())).await;
+                    }
+                    let _ = ws.close(None).await;
+                    return End::LoggedOut;
+                }
                 command(cmd, pend, v, &mut out).await;
             }
         }
@@ -345,6 +381,7 @@ async fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out
         Cmd::StopWatch => stop_watch(out).await,
         Cmd::GoLive(cfg) => go_live(cfg, out).await,
         Cmd::StopLive => stop_live(out).await,
+        Cmd::Logout => {} // handled by the session loop
         Cmd::Leave => {
             stop_watch(out).await;
             stop_live(out).await;
