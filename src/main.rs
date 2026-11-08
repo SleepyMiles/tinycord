@@ -26,6 +26,12 @@ fn init_log() {
             .with_ansi(false)
             .with_env_filter(filter)
             .init();
+        // A crash in any thread goes to the log too (there's no console).
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            tracing::error!("crash: {info}");
+            default(info);
+        }));
     }
 }
 

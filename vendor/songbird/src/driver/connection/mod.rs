@@ -154,6 +154,13 @@ impl Connection {
             if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
                 warn!("could not enlarge UDP receive buffer: {e}");
             }
+            // Sending a stream: a keyframe leaves as a burst too, and a full
+            // send buffer would drop packets on our own PC.
+            if config.video_send {
+                if let Err(e) = socket.set_send_buffer_size(4 * 1024 * 1024) {
+                    warn!("could not enlarge UDP send buffer: {e}");
+                }
+            }
             UdpSocket::from_std(socket.into())?
         } else {
             udp

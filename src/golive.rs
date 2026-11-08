@@ -30,6 +30,10 @@ use std::time::{Duration, Instant};
 pub const HEIGHTS: [u32; 5] = [480, 720, 1080, 1440, 0];
 pub const FPS: [u32; 3] = [15, 30, 60];
 
+/// Shortest time between keyframes sent because a viewer asked. Keyframes
+/// are big; answering every request at once can flood the connection.
+const KEYFRAME_GAP: Duration = Duration::from_millis(700);
+
 /// The best quality your account or this server allows, whichever is
 /// higher: (max picture height, 0 = any; max frames/s). Discord's limits:
 /// no Nitro 720p 30fps; Nitro Basic 1080p 60; Nitro any size 60;
@@ -320,6 +324,38 @@ struct Shared {
     bytes: AtomicU64,
     loss: Mutex<Vec<u8>>,
     remb: AtomicU64,
+    st: Stats,
+}
+
+/// Counters for the log (reset every few seconds).
+#[derive(Default)]
+struct Stats {
+    captured: AtomicU32,
+    encoded: AtomicU32,
+    keyframes: AtomicU32,
+    rc_skipped: AtomicU32,
+    e2ee_wait: AtomicU32,
+    encode_us: AtomicU64,
+    encode_us_max: AtomicU64,
+    capture_us_max: AtomicU64,
+    asked_keyframe: AtomicU32,
+    nacked: AtomicU32,
+    resent: AtomicU32,
+    resend_missing: AtomicU32,
+    send_retry: AtomicU32,
+    send_err: AtomicU32,
+    queue_max: AtomicU32,
+    loss_reports: AtomicU32,
+    /// Worst share of packets lost in one report (0-255).
+    loss_max: AtomicU32,
+}
+
+fn take(a: &AtomicU32) -> u32 {
+    a.swap(0, Ordering::Relaxed)
+}
+
+fn take64(a: &AtomicU64) -> u64 {
+    a.swap(0, Ordering::Relaxed)
 }
 
 static FEEDBACK: RwLock<Option<Arc<Shared>>> = RwLock::new(None);
@@ -328,9 +364,19 @@ fn on_rtcp(buf: &[u8]) {
     let Some(sh) = FEEDBACK.read().ok().and_then(|g| g.clone()) else { return };
     for fb in rtp::parse_feedback(buf, sh.video_ssrc) {
         match fb {
-            Feedback::Keyframe => sh.keyframe.store(true, Ordering::Relaxed),
-            Feedback::Nack(seqs) => sh.nacks.lock().unwrap().extend(seqs),
-            Feedback::Loss(f) => sh.loss.lock().unwrap().push(f),
+            Feedback::Keyframe => {
+                sh.st.asked_keyframe.fetch_add(1, Ordering::Relaxed);
+                sh.keyframe.store(true, Ordering::Relaxed);
+            }
+            Feedback::Nack(seqs) => {
+                sh.st.nacked.fetch_add(seqs.len() as u32, Ordering::Relaxed);
+                sh.nacks.lock().unwrap().extend(seqs);
+            }
+            Feedback::Loss(f) => {
+                sh.st.loss_reports.fetch_add(1, Ordering::Relaxed);
+                sh.st.loss_max.fetch_max(f as u32, Ordering::Relaxed);
+                sh.loss.lock().unwrap().push(f);
+            }
             Feedback::Remb(b) => sh.remb.store(b, Ordering::Relaxed),
         }
     }
@@ -394,6 +440,7 @@ impl Pipeline {
             bytes: AtomicU64::new(0),
             loss: Mutex::new(Vec::new()),
             remb: AtomicU64::new(0),
+            st: Stats::default(),
         });
         *FEEDBACK.write().unwrap() = Some(sh.clone());
         if let Ok(mut g) = video_hook::RTCP_SINK.write() {
@@ -560,7 +607,10 @@ fn capture_thread(cfg: LiveCfg, sh: Arc<Shared>, slot: Arc<Slot<Frame>>, free: m
                 }
             }
         });
+        let us = t.elapsed().as_micros() as u64;
+        sh.st.capture_us_max.fetch_max(us, Ordering::Relaxed);
         if done.is_some() {
+            sh.st.captured.fetch_add(1, Ordering::Relaxed);
             if let Some(old) = slot.put(Frame { pic, at: t }) {
                 spare.push(old.pic);
             }
@@ -611,9 +661,10 @@ fn encode_thread(
     let mut need_idr = true;
     let mut pk = VideoPacketizer::new(sh.video_ssrc);
     let mut last_at = t0;
-    // A still screen is re-sent a few times a second so viewers who join
-    // (or lose a packet) get a picture without waiting for a change.
-    let repeat = Duration::from_millis(250);
+    // When the screen doesn't change (most desktop apps), the last picture
+    // is sent again at a steady 15 fps. Discord's player treats long gaps
+    // between frames as a freeze and shows the stream as stuck or loading.
+    let repeat = Duration::from_secs_f64(1.0 / cfg.fps.clamp(1, 15) as f64);
     while !sh.stop.load(Ordering::Relaxed) {
         let at = match slot.take(repeat) {
             Some(f) => {
@@ -660,10 +711,13 @@ fn encode_thread(
             }
         }
         let (e, ..) = enc.as_mut().unwrap();
-        if sh.keyframe.swap(false, Ordering::Relaxed) && last_idr.elapsed() >= Duration::from_millis(300) {
+        // A viewer asked for a keyframe. If one went out very recently,
+        // keep the request and answer it a moment later (never drop it).
+        if last_idr.elapsed() >= KEYFRAME_GAP && sh.keyframe.swap(false, Ordering::Relaxed) {
             need_idr = true;
         }
-        if last_idr.elapsed() >= Duration::from_secs(10) {
+        // Safety net in case a request got lost.
+        if last_idr.elapsed() >= Duration::from_secs(20) {
             need_idr = true;
         }
         if need_idr {
@@ -673,8 +727,13 @@ fn encode_thread(
         let (u, v) = rest.split_at((w / 2) * (h / 2));
         let src = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
         let ms = at.saturating_duration_since(t0).as_millis() as u64;
-        let (au, kind) = match e.encode_at(&src, Timestamp::from_millis(ms)) {
-            Ok(bs) => (bs.to_vec(), bs.frame_type()),
+        let enc_start = Instant::now();
+        let res = e.encode_at(&src, Timestamp::from_millis(ms)).map(|bs| (bs.to_vec(), bs.frame_type()));
+        let us = enc_start.elapsed().as_micros() as u64;
+        sh.st.encode_us.fetch_add(us, Ordering::Relaxed);
+        sh.st.encode_us_max.fetch_max(us, Ordering::Relaxed);
+        let (au, kind) = match res {
+            Ok(x) => x,
             Err(err) => {
                 tracing::warn!("encode: {err}");
                 enc = None;
@@ -682,15 +741,19 @@ fn encode_thread(
             }
         };
         if au.is_empty() || matches!(kind, FrameType::Skip | FrameType::Invalid) {
+            sh.st.rc_skipped.fetch_add(1, Ordering::Relaxed);
             continue; // rate control skipped this one
         }
+        sh.st.encoded.fetch_add(1, Ordering::Relaxed);
         if matches!(kind, FrameType::IDR | FrameType::I) {
+            sh.st.keyframes.fetch_add(1, Ordering::Relaxed);
             need_idr = false;
             last_idr = Instant::now();
         }
         // End-to-end encryption (DAVE). Until it's ready nothing can go out;
         // the first picture after that must be a keyframe.
         let Some(frame) = sender.e2ee(davey::MediaType::VIDEO, davey::Codec::H264, &au) else {
+            sh.st.e2ee_wait.fetch_add(1, Ordering::Relaxed);
             need_idr = true;
             continue;
         };
@@ -721,12 +784,19 @@ fn send_thread(sh: Arc<Shared>, sender: Arc<MediaSender>, rx: mpsc::Receiver<Enc
     let mut last_change = Instant::now();
     let mut clean_since = Instant::now();
 
-    let send = |p: &Packet| -> usize {
+    let mut last_log = Instant::now();
+    // Ok(bytes), or Err(()) when the OS send buffer is full (try again).
+    let send = |p: &Packet| -> Result<usize, ()> {
         match sender.send(&p.header, &p.body) {
-            Ok(n) => n,
+            Ok(n) => Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                sh.st.send_retry.fetch_add(1, Ordering::Relaxed);
+                Err(())
+            }
             Err(e) => {
                 tracing::debug!("send: {e}");
-                0
+                sh.st.send_err.fetch_add(1, Ordering::Relaxed);
+                Ok(0)
             }
         }
     };
@@ -738,6 +808,7 @@ fn send_thread(sh: Arc<Shared>, sender: Arc<MediaSender>, rx: mpsc::Receiver<Enc
             last_ts = Some((f.ts, f.at));
             stat_frames += 1;
             queue.extend(f.packets);
+            sh.st.queue_max.fetch_max(queue.len() as u32, Ordering::Relaxed);
             // Way behind (shouldn't happen): start over from a keyframe.
             if queue.len() > 4000 {
                 queue.clear();
@@ -749,20 +820,29 @@ fn send_thread(sh: Arc<Shared>, sender: Arc<MediaSender>, rx: mpsc::Receiver<Enc
         let nacks = std::mem::take(&mut *sh.nacks.lock().unwrap());
         for seq in nacks {
             let p = if rtx_ssrc != 0 { hist.rtx(seq, rtx_ssrc) } else { hist.get(seq) };
-            if let Some(p) = p {
-                allowance -= send(&p) as f64;
+            match p {
+                Some(p) => {
+                    sh.st.resent.fetch_add(1, Ordering::Relaxed);
+                    allowance -= send(&p).unwrap_or(0) as f64;
+                }
+                None => {
+                    sh.st.resend_missing.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
-        // Pace at ~3x the video bitrate so a big keyframe doesn't hit the
+        // Pace at 2.5x the video bitrate so a big keyframe doesn't hit the
         // network as one burst.
-        let rate = (sh.bitrate.load(Ordering::Relaxed) as f64 * 3.0).max(8_000_000.0) / 8.0;
+        let rate = (sh.bitrate.load(Ordering::Relaxed) as f64 * 2.5).max(5_000_000.0) / 8.0;
         let now = Instant::now();
-        allowance = (allowance + now.duration_since(clock).as_secs_f64() * rate).min(16_000.0);
+        allowance = (allowance + now.duration_since(clock).as_secs_f64() * rate).min(12_000.0);
         clock = now;
         while allowance > 0.0 {
             let Some(p) = queue.pop_front() else { break };
-            let n = send(&p);
+            let Ok(n) = send(&p) else {
+                queue.push_front(p); // buffer full: same packet next round
+                break;
+            };
             allowance -= n as f64;
             packets = packets.wrapping_add(1);
             octets = octets.wrapping_add(p.body.len() as u32);
@@ -784,6 +864,12 @@ fn send_thread(sh: Arc<Shared>, sender: Arc<MediaSender>, rx: mpsc::Receiver<Enc
             adapt(&sh, &mut loss_avg, &mut last_change, &mut clean_since);
         }
 
+        if last_log.elapsed() >= Duration::from_secs(5) {
+            let secs = last_log.elapsed().as_secs_f64();
+            last_log = Instant::now();
+            log_stats(&sh, secs);
+        }
+
         if last_stats.elapsed() >= Duration::from_secs(1) {
             let secs = last_stats.elapsed().as_secs_f64();
             last_stats = Instant::now();
@@ -802,6 +888,41 @@ fn send_thread(sh: Arc<Shared>, sender: Arc<MediaSender>, rx: mpsc::Receiver<Enc
             });
         }
     }
+}
+
+/// One line in the log every 5 s: what the stream is doing on this PC.
+fn log_stats(sh: &Shared, secs: f64) {
+    let st = &sh.st;
+    let encoded = take(&st.encoded);
+    let enc_us = take64(&st.encode_us);
+    let size = sh.size.load(Ordering::Relaxed);
+    tracing::info!(
+        "live {}x{}: capture {:.0} fps (max {:.1} ms), encode {:.0} fps (avg {:.1} ms, max {:.1} ms), \
+         rc skipped {}, keyframes {} (viewers asked {}), lost {} resent {} too old {}, \
+         send retries {} errors {}, queue max {}, waiting for e2ee {}, target {} kbit/s, \
+         loss reports {} (worst {}%), server estimate {} kbit/s",
+        size >> 16,
+        size & 0xffff,
+        take(&st.captured) as f64 / secs,
+        take64(&st.capture_us_max) as f64 / 1000.0,
+        encoded as f64 / secs,
+        if encoded > 0 { enc_us as f64 / encoded as f64 / 1000.0 } else { 0.0 },
+        take64(&st.encode_us_max) as f64 / 1000.0,
+        take(&st.rc_skipped),
+        take(&st.keyframes),
+        take(&st.asked_keyframe),
+        take(&st.nacked),
+        take(&st.resent),
+        take(&st.resend_missing),
+        take(&st.send_retry),
+        take(&st.send_err),
+        take(&st.queue_max),
+        take(&st.e2ee_wait),
+        sh.bitrate.load(Ordering::Relaxed) / 1000,
+        take(&st.loss_reports),
+        take(&st.loss_max) * 100 / 256,
+        sh.remb.load(Ordering::Relaxed) / 1000,
+    );
 }
 
 /// Lower the bitrate when viewers' reports show lost packets; creep back up
@@ -1041,6 +1162,52 @@ mod bench {
                 bytes += enc.encode_at(&src, Timestamp::from_millis(i as u64 * 16)).unwrap().to_vec().len();
             }
             println!("sliced={sliced}: {:?}/frame, {} KB total", t.elapsed() / frames.len() as u32, bytes / 1024);
+            // Same picture again and again (a still desktop).
+            let pic = &frames[frames.len() - 1];
+            let (y, rest) = pic.data.split_at(w * h);
+            let (u, v) = rest.split_at((w / 2) * (h / 2));
+            let src = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
+            let t = Instant::now();
+            let mut rb = 0;
+            for i in 0..30u64 {
+                rb += enc.encode_at(&src, Timestamp::from_millis(1000 + i * 16)).unwrap().to_vec().len();
+            }
+            println!("  repeat of an unchanged picture: {:?}/frame, {} bytes each", t.elapsed() / 30, rb / 30);
         }
+    }
+}
+
+#[cfg(test)]
+mod still_screen {
+    use super::*;
+
+    /// What comes out when the same picture is encoded again and again
+    /// (a desktop app where nothing moves).
+    #[test]
+    fn repeats_produce_frames() {
+        use openh264::encoder::Encoder;
+        use openh264::formats::YUVSlices;
+        use openh264::{OpenH264API, Timestamp};
+        let (w, h, fps) = (1280usize, 720usize, 30u32);
+        let cap = Capturer::new(0).unwrap();
+        let mut pic = I420 { w: 0, h: 0, data: Vec::new() };
+        cap.with_frame(|src, sw, sh, pitch, _| convert::bgra_to_i420(src, sw, sh, pitch, &mut pic));
+        assert_eq!((pic.w, pic.h), (w, h));
+        let mut enc = Encoder::with_api_config(OpenH264API::from_source(), encoder_config(fps, bitrate(w as u32, h as u32, fps))).unwrap();
+        let mut out = Vec::new();
+        for i in 0..20u64 {
+            if i == 12 {
+                enc.force_intra_frame();
+            }
+            let (y, rest) = pic.data.split_at(w * h);
+            let (u, v) = rest.split_at((w / 2) * (h / 2));
+            let src = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
+            // Repeats come every 250 ms.
+            let bs = enc.encode_at(&src, Timestamp::from_millis(i * 250)).unwrap();
+            out.push((bs.to_vec().len(), format!("{:?}", bs.frame_type())));
+        }
+        println!("{out:?}");
+        // Every repeat must produce a frame (an empty one would send nothing).
+        assert!(out.iter().all(|(n, kind)| *n > 0 && kind != "Skip"), "{out:?}");
     }
 }
