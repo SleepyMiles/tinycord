@@ -3852,13 +3852,14 @@ dependencies = [
 
 [[package]]
 name = "tinycord"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "cpal",
  "futures-util",
  "nnnoiseless",
  "parking_lot 0.12.5",
+ "rubato",
  "serde_json",
  "songbird",
  "symphonia",

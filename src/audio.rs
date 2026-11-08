@@ -117,6 +117,109 @@ fn trim_with_crossfade(q: &mut VecDeque<f32>, max: usize, target: usize) {
     }
 }
 
+/// Sample-rate converter. Same rate: the cheap path below (exact copy, or a
+/// tiny 0.5% speed nudge when catching up). Different rates (e.g. a 44.1 kHz
+/// mic): a windowed-sinc resampler, which keeps the crisp high end of your
+/// voice that straight-line interpolation dulls.
+struct Converter {
+    lin: Resampler,
+    base_step: f64,
+    sinc: Option<rubato::SincFixedIn<f32>>,
+    inbuf: Vec<f32>,
+    fast: bool,
+}
+
+impl Converter {
+    fn new(from: u32, to: u32) -> Self {
+        let lin = Resampler::new(from, to);
+        let sinc = if from == to {
+            None
+        } else {
+            use rubato::{SincInterpolationParameters, SincInterpolationType, WindowFunction};
+            let params = SincInterpolationParameters {
+                sinc_len: 128,
+                f_cutoff: 0.95,
+                interpolation: SincInterpolationType::Linear,
+                oversampling_factor: 128,
+                window: WindowFunction::BlackmanHarris2,
+            };
+            rubato::SincFixedIn::<f32>::new(to as f64 / from as f64, 1.02, params, 240, 1).ok()
+        };
+        Self { base_step: lin.step, lin, sinc, inbuf: Vec::new(), fast: false }
+    }
+
+    /// Input samples consumed per output sample (roughly).
+    fn step(&self) -> f64 {
+        self.lin.step
+    }
+
+    /// Run 0.5% fast (consume input a little quicker) to shrink a backlog.
+    fn set_fast(&mut self, fast: bool) {
+        if fast == self.fast {
+            return;
+        }
+        self.fast = fast;
+        let f = if fast { 1.005 } else { 1.0 };
+        self.lin.step = self.base_step * f;
+        if let Some(r) = self.sinc.as_mut() {
+            use rubato::Resampler as _;
+            let _ = r.set_resample_ratio_relative(1.0 / f, true);
+        }
+    }
+
+    fn run(&mut self, input: &[f32], out: &mut impl Extend<f32>) {
+        let Some(r) = self.sinc.as_mut() else {
+            self.lin.run(input, out);
+            return;
+        };
+        use rubato::Resampler as _;
+        self.inbuf.extend_from_slice(input);
+        loop {
+            let need = r.input_frames_next();
+            if self.inbuf.len() < need {
+                break;
+            }
+            if let Ok(res) = r.process(&[&self.inbuf[..need]], None) {
+                out.extend(res[0].iter().copied());
+            }
+            self.inbuf.drain(..need);
+        }
+    }
+}
+
+/// Second-order high-pass at 80 Hz: removes breath rumble, pops and desk
+/// thumps that muddy speech and fool the auto gain. Voice is unaffected.
+struct HighPass {
+    b: [f32; 3],
+    a: [f32; 2],
+    x: [f32; 2],
+    y: [f32; 2],
+}
+
+impl HighPass {
+    fn new(cutoff: f32, rate: f32) -> Self {
+        let w0 = 2.0 * std::f32::consts::PI * cutoff / rate;
+        let alpha = w0.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
+        let c = w0.cos();
+        let a0 = 1.0 + alpha;
+        Self {
+            b: [(1.0 + c) / 2.0 / a0, -(1.0 + c) / a0, (1.0 + c) / 2.0 / a0],
+            a: [-2.0 * c / a0, (1.0 - alpha) / a0],
+            x: [0.0; 2],
+            y: [0.0; 2],
+        }
+    }
+
+    fn run(&mut self, v: f32) -> f32 {
+        let y = self.b[0] * v + self.b[1] * self.x[0] + self.b[2] * self.x[1]
+            - self.a[0] * self.y[0]
+            - self.a[1] * self.y[1];
+        self.x = [v, self.x[0]];
+        self.y = [y, self.y[0]];
+        y
+    }
+}
+
 /// Simple linear resampler that keeps its position between calls.
 struct Resampler {
     step: f64,
@@ -187,6 +290,7 @@ struct MicProcessor {
     /// need turning down to stay under the ceiling.
     delay: VecDeque<(f32, f32)>,
     limit: f32,
+    hpf: HighPass,
 }
 
 /// Limiter look-ahead (2 ms) and ceiling.
@@ -205,16 +309,17 @@ impl MicProcessor {
             speech_pow: 0.0,
             delay: VecDeque::with_capacity(LOOKAHEAD + 1),
             limit: 1.0,
+            hpf: HighPass::new(80.0, RATE as f32),
         }
     }
 
     fn run(&mut self, input: &[f32], out: &mut VecDeque<f32>, shared: &Shared) {
         const N: usize = DenoiseState::FRAME_SIZE;
         // Auto gain aims for a speaking level of -16.5 dBFS RMS (loud, with
-        // room for peaks), boosting up to +24 dB.
+        // room for peaks), boosting up to +30 dB for soft, breathy speech.
         const TARGET_RMS: f32 = 0.15;
         const MIN_GAIN: f32 = 0.5;
-        const MAX_GAIN: f32 = 16.0;
+        const MAX_GAIN: f32 = 31.6;
 
         self.pending.extend_from_slice(input);
         let ns_on = shared.noise_suppression.load(Ordering::Relaxed);
@@ -238,7 +343,7 @@ impl MicProcessor {
 
             let mut sum = 0f32;
             for s in self.frame_out.iter_mut() {
-                *s /= 32768.0;
+                *s = self.hpf.run(*s / 32768.0);
                 sum += *s * *s;
             }
             let pow = sum / N as f32;
@@ -249,8 +354,16 @@ impl MicProcessor {
                 shared.last_voice_ms.store(shared.now_ms(), Ordering::Relaxed);
             }
 
+            // Auto gain listens for speech on its own terms: soft talking up
+            // to 12 dB under your sensitivity line still counts, so quiet,
+            // breathy speech gets brought up instead of ignored.
+            let speech_for_gain = if ns_on {
+                vad_prob > 0.5 && db > -65.0
+            } else {
+                db > (threshold - 12.0).max(-60.0)
+            };
             if agc_on {
-                if voice {
+                if speech_for_gain {
                     // React to the speaking level over ~70 ms, not to each
                     // 10 ms frame (single frames jump around a lot).
                     if self.speech_pow == 0.0 {
@@ -316,8 +429,7 @@ fn soft_limit(x: f32) -> f32 {
 /// a small cushion before starting, fades in, lets the sound die away if the
 /// queue runs dry, and plays 0.5% faster when audio piles up.
 struct Playout {
-    rs: Resampler,
-    base_step: f64,
+    rs: Converter,
     conv: VecDeque<f32>,
     tmp: Vec<f32>,
     playing: bool,
@@ -328,10 +440,8 @@ struct Playout {
 
 impl Playout {
     fn new(device_rate: u32) -> Self {
-        let rs = Resampler::new(RATE as u32, device_rate);
         Self {
-            base_step: rs.step,
-            rs,
+            rs: Converter::new(RATE as u32, device_rate),
             conv: VecDeque::new(),
             tmp: Vec::new(),
             playing: false,
@@ -348,9 +458,9 @@ impl Playout {
             self.playing = true;
             self.fade = 0.0;
         }
-        self.rs.step = if backlog > OUT_CATCHUP { self.base_step * 1.005 } else { self.base_step };
+        self.rs.set_fast(backlog > OUT_CATCHUP);
         while self.playing && self.conv.len() < frames {
-            let need = ((frames - self.conv.len()) as f64 * self.rs.step).ceil() as usize + 1;
+            let need = ((frames - self.conv.len()) as f64 * self.rs.step()).ceil() as usize + 1;
             self.tmp.clear();
             {
                 let mut o = shared.out.lock();
@@ -533,8 +643,7 @@ fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> 
     let fmt = sup.sample_format();
     let cfg = sup.config();
     let ch = cfg.channels.max(1) as usize;
-    let mut rs = Resampler::new(cfg.sample_rate, RATE as u32);
-    let base_step = rs.step;
+    let mut rs = Converter::new(cfg.sample_rate, RATE as u32);
     let mut mono: Vec<f32> = Vec::new();
     let mut at48: Vec<f32> = Vec::new();
     let mut proc = MicProcessor::new();
@@ -542,7 +651,7 @@ fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> 
     let mut handle = move |data: &[f32]| {
         downmix.run(data, &mut mono);
         let backlog = shared.mic.lock().len();
-        rs.step = if backlog > MIC_CATCHUP { base_step * 1.005 } else { base_step };
+        rs.set_fast(backlog > MIC_CATCHUP);
         at48.clear();
         rs.run(&mono, &mut at48);
         let mut m = shared.mic.lock();
@@ -855,6 +964,39 @@ mod tests {
         let peak = last.iter().fold(0f32, |m, x| m.max(x.abs()));
         println!("downmix: one-sided stereo peak {peak:.3} (input 0.5)");
         assert!(peak > 0.45);
+    }
+
+    /// A 44.1 kHz mic with an 8 kHz tone (the "s"/"t" region of speech):
+    /// the sinc converter must keep it at full strength.
+    #[test]
+    fn resampling_keeps_crisp_highs() {
+        let input: Vec<f32> = (0..44_100).map(|i| (i as f32 * 8000.0 * 6.283 / 44_100.0).sin() * 0.5).collect();
+        let rms_of = |v: &[f32]| (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt();
+        let mut hq = Converter::new(44_100, 48_000);
+        let mut out_hq: Vec<f32> = Vec::new();
+        for c in input.chunks(441) {
+            hq.run(c, &mut out_hq);
+        }
+        let mut lin = Resampler::new(44_100, 48_000);
+        let mut out_lin: Vec<f32> = Vec::new();
+        lin.run(&input, &mut out_lin);
+        let a = rms_of(&out_hq[4800..out_hq.len() - 4800]) / rms_of(&input);
+        let b = rms_of(&out_lin[4800..out_lin.len() - 4800]) / rms_of(&input);
+        println!("8 kHz kept: sinc {:.1}%  linear {:.1}%  ({} samples out for 1 s)", a * 100.0, b * 100.0, out_hq.len());
+        assert!(a > 0.97);
+        assert!((out_hq.len() as i64 - 48_000).abs() < 600);
+    }
+
+    #[test]
+    fn high_pass_removes_rumble_keeps_voice() {
+        let gain_at = |f: f32| {
+            let mut h = HighPass::new(80.0, 48_000.0);
+            let out: Vec<f32> = (0..48_000).map(|i| h.run((i as f32 * f * 6.283 / 48_000.0).sin())).collect();
+            (out[24_000..].iter().map(|x| x * x).sum::<f32>() / 24_000.0 * 2.0).sqrt()
+        };
+        let (rumble, voice) = (gain_at(25.0), gain_at(300.0));
+        println!("high-pass: 25 Hz kept {:.0}%, 300 Hz kept {:.0}%", rumble * 100.0, voice * 100.0);
+        assert!(rumble < 0.15 && voice > 0.95);
     }
 
     #[test]
