@@ -32,7 +32,7 @@ use tokio_websockets::{
 use tracing::{debug, instrument};
 use url::Url;
 
-pub struct WsStream(WebSocketStream<MaybeTlsStream<TcpStream>>, bool);
+pub struct WsStream(WebSocketStream<MaybeTlsStream<TcpStream>>, u8);
 
 impl WsStream {
     #[instrument]
@@ -56,7 +56,7 @@ impl WsStream {
             .connect()
             .await?;
 
-        Ok(Self(stream, false))
+        Ok(Self(stream, 0))
     }
 
     pub(crate) async fn recv_event(&mut self) -> Result<Option<Event>> {
@@ -75,9 +75,10 @@ impl WsStream {
         convert_ws_message(self.0.try_next().await?, self.1)
     }
 
-    /// tinycord patch: pass this connection's messages to `video_hook::WS_TAP`.
-    pub(crate) fn set_tap(&mut self, on: bool) {
-        self.1 = on;
+    /// tinycord patch: pass this connection's messages to tinycord.
+    /// 0 = no, 1 = watching (`WS_TAP`), 2 = our own stream (`WS_TAP_SEND`).
+    pub(crate) fn set_tap(&mut self, kind: u8) {
+        self.1 = kind;
     }
 
     /// tinycord patch: send a hand-written JSON message.
@@ -149,14 +150,12 @@ impl From<BinaryError> for Error {
 }
 
 #[inline]
-pub(crate) fn convert_ws_message(message: Option<Message>, tap: bool) -> Result<Option<Event>> {
+pub(crate) fn convert_ws_message(message: Option<Message>, tap: u8) -> Result<Option<Event>> {
     #[cfg(feature = "tungstenite")]
     match message {
         Some(Message::Text(ref payload)) => {
-            if tap {
-                if let Some(hook) = crate::video_hook::WS_TAP.read().ok().and_then(|g| *g) {
-                    hook(payload);
-                }
+            if tap != 0 {
+                crate::video_hook::tap(tap, payload);
             }
             return Ok(serde_json::from_str(payload)
                 .map_err(|e| {

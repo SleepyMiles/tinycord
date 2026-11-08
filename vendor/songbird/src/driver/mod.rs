@@ -26,6 +26,14 @@ mod test_impls;
 
 use connection::error::{Error, Result};
 pub use crypto::CryptoMode;
+
+/// tinycord patch: internal types used by `video_hook::MediaSender`.
+pub(crate) mod crypto_cipher {
+    pub(crate) use super::crypto::Cipher;
+}
+pub(crate) mod tasks_message {
+    pub(crate) use super::tasks::message::WsMessage;
+}
 pub(crate) use crypto::CryptoState;
 #[cfg(feature = "receive")]
 pub use decode_mode::*;

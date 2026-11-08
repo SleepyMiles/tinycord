@@ -38,6 +38,7 @@ const ID_MIC: i32 = 116;
 const ID_SPKDEV: i32 = 117;
 const ID_VOL: i32 = 118;
 const ID_NSLVL: i32 = 119;
+const ID_LIVE: i32 = 120;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_TOPMOST: usize = 2;
@@ -72,7 +73,7 @@ struct Row {
 struct Ui {
     hwnd: HWND,
     overlay: HWND,
-    c: [HWND; 20],
+    c: [HWND; 21],
     font: HFONT,
     bold: HFONT,
     ofont: HFONT,
@@ -90,15 +91,20 @@ thread_local! {
     static UI: RefCell<Option<Ui>> = const { RefCell::new(None) };
 }
 
-fn wide(s: &str) -> Vec<u16> {
+pub(crate) fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// (main window, normal font, dpi) for the other windows.
+pub(crate) fn main_info() -> Option<(HWND, HFONT, i32)> {
+    with_ui(|u| (u.hwnd, u.font, u.dpi))
 }
 
 fn with_ui<R>(f: impl FnOnce(&mut Ui) -> R) -> Option<R> {
     UI.with(|u| u.borrow_mut().as_mut().map(f))
 }
 
-fn sc(dpi: i32, v: i32) -> i32 {
+pub(crate) fn sc(dpi: i32, v: i32) -> i32 {
     v * dpi / 96
 }
 
@@ -130,7 +136,7 @@ fn key_name(vk: u32) -> String {
     }
 }
 
-unsafe fn set_text(h: HWND, s: &str) {
+pub(crate) unsafe fn set_text(h: HWND, s: &str) {
     let w = wide(s);
     SetWindowTextW(h, w.as_ptr());
 }
@@ -142,7 +148,7 @@ unsafe fn get_text(h: HWND) -> String {
     String::from_utf16_lossy(&buf[..got.max(0) as usize])
 }
 
-unsafe fn make_font(dpi: i32, pt: i32, weight: i32) -> HFONT {
+pub(crate) unsafe fn make_font(dpi: i32, pt: i32, weight: i32) -> HFONT {
     let face = wide("Segoe UI");
     CreateFontW(
         -(pt * dpi / 72),
@@ -230,12 +236,13 @@ pub fn run() {
         if let Ok(mut f) = crate::video::ON_FRAME.write() {
             *f = Some(view_repaint);
         }
+        crate::ui_live::register(hinst);
 
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
                 hwnd: null_mut(),
                 overlay: null_mut(),
-                c: [null_mut(); 20],
+                c: [null_mut(); 21],
                 font: make_font(dpi, 9, FW_NORMAL as i32),
                 bold: make_font(dpi, 9, FW_BOLD as i32),
                 ofont: make_font(dpi, 11, FW_SEMIBOLD as i32),
@@ -292,6 +299,10 @@ pub fn run() {
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            let lw = crate::ui_live::hwnd();
+            if !lw.is_null() && IsDialogMessageW(lw, &msg) != 0 {
+                continue;
+            }
             if IsDialogMessageW(hwnd, &msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -300,7 +311,7 @@ pub fn run() {
     }
 }
 
-unsafe fn child(
+pub(crate) unsafe fn child(
     parent: HWND,
     class: &str,
     text: &str,
@@ -334,7 +345,7 @@ unsafe fn child(
     h
 }
 
-unsafe fn combo_add(h: HWND, items: &[&str]) {
+pub(crate) unsafe fn combo_add(h: HWND, items: &[&str]) {
     for it in items {
         let w = wide(it);
         SendMessageW(h, CB_ADDSTRING, 0, w.as_ptr() as isize);
@@ -350,7 +361,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let cbo = |x, y, w, id| {
         child(hwnd, "COMBOBOX", "", ts | WS_VSCROLL | CBS_DROPDOWNLIST as u32, x, y, w, 300, id, dpi, font)
     };
-    let mut c = [null_mut(); 20];
+    let mut c = [null_mut(); 21];
     c[0] = child(hwnd, "STATIC", "Starting...", SS_LEFT as u32 | SS_ENDELLIPSIS as u32, 6, 6, 268, 18, ID_STATUS, dpi, font);
     c[1] = child(hwnd, "EDIT", "", ts | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32, 6, 28, 190, 24, ID_TOKEN, dpi, font);
     c[2] = b("Log in", BS_PUSHBUTTON, 202, 28, 72, 24, ID_LOGIN);
@@ -368,9 +379,10 @@ unsafe fn create_controls(hwnd: HWND) {
         dpi,
         font,
     );
-    c[5] = b("Join", BS_PUSHBUTTON, 6, 264, 86, 26, ID_JOIN);
-    c[6] = b("Mute", BS_AUTOCHECKBOX | BS_PUSHLIKE, 97, 264, 86, 26, ID_MUTE);
-    c[7] = b("Deafen", BS_AUTOCHECKBOX | BS_PUSHLIKE, 188, 264, 86, 26, ID_DEAF);
+    c[5] = b("Join", BS_PUSHBUTTON, 6, 264, 64, 26, ID_JOIN);
+    c[6] = b("Mute", BS_AUTOCHECKBOX | BS_PUSHLIKE, 74, 264, 64, 26, ID_MUTE);
+    c[7] = b("Deafen", BS_AUTOCHECKBOX | BS_PUSHLIKE, 142, 264, 64, 26, ID_DEAF);
+    c[20] = b("Go Live", BS_PUSHBUTTON, 210, 264, 64, 26, ID_LIVE);
     c[8] = cbo(6, 296, 130, ID_MODE);
     c[9] = b("PTT key: not set", BS_PUSHBUTTON, 142, 295, 132, 25, ID_KEY);
     c[10] = child(hwnd, "tinycord_slider", "", 0, 6, 326, 268, 22, ID_SENS, dpi, font);
@@ -497,6 +509,13 @@ unsafe fn on_command(id: i32, code: u32) {
                 state::send(Cmd::Leave);
             } else {
                 join_selected();
+            }
+        }
+        (ID_LIVE, BN_CLICKED) => {
+            if state().live.is_some() {
+                state::send(Cmd::StopLive);
+            } else {
+                crate::ui_live::open();
             }
         }
         (ID_MUTE, BN_CLICKED) => {
@@ -730,6 +749,7 @@ unsafe fn refresh() {
         format!("PTT key: {}", key_name(s.ptt_key))
     };
     let mode = s.mode;
+    let live = s.live.is_some();
     drop(s);
 
     // Pick a server automatically the first time.
@@ -803,6 +823,7 @@ unsafe fn refresh() {
     set_text(c[5], if selected_live() { "Watch" } else if joined { "Leave" } else { "Join" });
     SendMessageW(c[6], BM_SETCHECK, muted as usize, 0);
     SendMessageW(c[7], BM_SETCHECK, deaf as usize, 0);
+    set_text(c[20], if live { "Stop Live" } else { "Go Live" });
     set_text(c[9], &key_txt);
     EnableWindow(c[9], (mode == MicMode::Ptt || key_txt.starts_with("Press")) as i32);
 
@@ -811,9 +832,10 @@ unsafe fn refresh() {
 
     update_overlay();
     update_viewer();
+    crate::ui_live::update();
 }
 
-unsafe fn update_devices(c: &[HWND; 20]) {
+unsafe fn update_devices(c: &[HWND; 21]) {
     let (ins, outs, mic, spk) = {
         let s = state();
         (s.input_devices.clone(), s.output_devices.clone(), s.mic_device.clone(), s.spk_device.clone())

@@ -154,6 +154,10 @@ pub struct Config {
     /// `video_hook::VIDEO_SINK` (used for Go Live stream connections).
     pub video_receive: bool,
 
+    /// tinycord patch: this connection sends our own Go Live stream; a
+    /// `video_hook::MediaSender` is published once it is up.
+    pub video_send: bool,
+
     #[cfg(feature = "driver")]
     /// Configures the maximum amount of time to wait for an attempted voice
     /// connection to Discord.
@@ -230,6 +234,7 @@ impl Default for Config {
             #[cfg(feature = "driver")]
             use_softclip: true,
             video_receive: false,
+            video_send: false,
             #[cfg(feature = "driver")]
             driver_retry: Retry::default(),
             #[cfg(feature = "driver")]
@@ -318,6 +323,13 @@ impl Config {
     #[must_use]
     pub fn video_receive(mut self, on: bool) -> Self {
         self.video_receive = on;
+        self
+    }
+
+    /// tinycord patch: see [`Config::video_send`].
+    #[must_use]
+    pub fn video_send(mut self, on: bool) -> Self {
+        self.video_send = on;
         self
     }
 

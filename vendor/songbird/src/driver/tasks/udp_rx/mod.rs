@@ -201,7 +201,7 @@ impl UdpRx {
             pli.extend_from_slice(&sender.to_be_bytes());
             pli.extend_from_slice(&media.to_be_bytes());
             self.pli_counter = self.pli_counter.wrapping_add(1);
-            match self.cipher.encrypt_rtcp_raw(&mut pli, 8, self.pli_counter) {
+            match self.cipher.encrypt_raw(&mut pli, 8, self.pli_counter) {
                 Ok(()) => {
                     if let Err(e) = self.udp_socket.try_send(&pli) {
                         warn!("keyframe request send failed: {e}");
@@ -221,6 +221,18 @@ impl UdpRx {
         // to rebuild their context etc. (hence, the `let _ =` statements.), as it will
         // try to make contact every 20ms.
         let crypto_mode = self.crypto_mode;
+
+        // tinycord patch: on our own stream's connection, viewers' feedback
+        // (keyframe requests, lost-packet reports) goes to tinycord.
+        if self.config.video_send && packet.len() >= 8 && (200..=207).contains(&packet[1]) {
+            let sink = crate::video_hook::RTCP_SINK.read().ok().and_then(|g| *g);
+            if let Some(sink) = sink {
+                if let Some(plain) = self.cipher.decrypt_raw(&packet, 8) {
+                    sink(&plain);
+                }
+            }
+            return;
+        }
 
         match demux::demux_mut(packet.as_mut()) {
             DemuxedMut::Rtp(mut rtp) => {

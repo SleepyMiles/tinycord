@@ -9,4 +9,6 @@ pub enum WsMessage {
     SetKeepalive(f64),
     Speaking(bool),
     Deliver(GatewayEvent),
+    /// tinycord patch: send this JSON text as-is.
+    Raw(String),
 }

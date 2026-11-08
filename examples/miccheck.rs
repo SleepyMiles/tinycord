@@ -2,6 +2,7 @@
 #[path = "../src/audio.rs"]
 mod audio;
 mod state { pub fn set_status(_: impl Into<String>) {} }
+mod video { pub static STREAM_VOLUME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3f80_0000); }
 use songbird::input::codecs::{get_codec_registry, get_probe};
 use songbird::input::{AudioStream, LiveInput, RawAdapter};
 fn main() {

@@ -172,6 +172,18 @@ impl AuxNetwork {
                                 }
                             }
                         },
+                        Ok(WsMessage::Raw(text)) => {
+                            if !self.dont_send {
+                                ws_error |= match self.ws_client.send_raw(text).await {
+                                    Err(e) => {
+                                        should_reconnect = ws_error_is_not_final(&e);
+                                        ws_reason = Some((&e).into());
+                                        true
+                                    },
+                                    _ => false,
+                                }
+                            }
+                        },
                         Ok(WsMessage::Deliver(msg)) => {
                             ws_error |= match self.process_ws(interconnect, msg).await {
                                 Err(e) => {

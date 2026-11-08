@@ -68,6 +68,10 @@ pub fn load_settings() {
                 }
             }
             "stream_pin" => crate::video::STREAM_PIN.store(v.trim() == "1", std::sync::atomic::Ordering::Relaxed),
+            "live_monitor" => s.live_cfg.monitor = v.trim().parse().unwrap_or(usize::MAX),
+            "live_res" => s.live_cfg.height = v.trim().parse().unwrap_or(720),
+            "live_fps" => s.live_cfg.fps = v.trim().parse().unwrap_or(30),
+            "live_sound" => s.live_cfg.sound = v.trim() != "0",
             "input_volume" => {
                 if let Ok(x) = v.trim().parse::<f32>() {
                     crate::voice::shared()
@@ -103,7 +107,7 @@ pub fn save_settings() {
         crate::voice::shared().vad_db.load(std::sync::atomic::Ordering::Relaxed),
     );
     let text = format!(
-        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\nns_strength={}\nclarity={}\nstream_volume={}\nstream_pin={}\n",
+        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\nns_strength={}\nclarity={}\nstream_volume={}\nstream_pin={}\nlive_monitor={}\nlive_res={}\nlive_fps={}\nlive_sound={}\n",
         match s.mode {
             MicMode::Open => "open",
             MicMode::Voice => "voice",
@@ -123,6 +127,10 @@ pub fn save_settings() {
         crate::voice::shared().clarity.load(std::sync::atomic::Ordering::Relaxed) as u8,
         f32::from_bits(crate::video::STREAM_VOLUME.load(std::sync::atomic::Ordering::Relaxed)),
         crate::video::STREAM_PIN.load(std::sync::atomic::Ordering::Relaxed) as u8,
+        s.live_cfg.monitor,
+        s.live_cfg.height,
+        s.live_cfg.fps,
+        s.live_cfg.sound as u8,
     );
     drop(s);
     let _ = std::fs::write(dir().join("settings.txt"), text);

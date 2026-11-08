@@ -37,7 +37,7 @@ pub(crate) struct Connection {
     pub(crate) ssrc: u32,
     pub(crate) ws: Sender<WsMessage>,
     /// tinycord patch: this is a video (Go Live) connection.
-    pub(crate) video: bool,
+    pub(crate) video: u8,
 }
 
 impl Connection {
@@ -72,10 +72,10 @@ impl Connection {
         let mut hello = None;
         let mut ready = None;
 
-        if config.video_receive {
-            // tinycord patch: a viewer-only video connection. Same as a voice
-            // identify, plus "this client handles video".
-            client.set_tap(true);
+        if config.video_receive || config.video_send {
+            // tinycord patch: a Go Live connection. Same as a voice identify,
+            // plus "this client handles video".
+            client.set_tap(if config.video_send { 2 } else { 1 });
             let identify = serde_json::json!({
                 "op": 0,
                 "d": {
@@ -85,7 +85,11 @@ impl Connection {
                     "user_id": info.user_id.0.to_string(),
                     "max_dave_protocol_version": davey::DAVE_PROTOCOL_VERSION,
                     "video": true,
-                    "streams": [{"type": "video", "rid": "100", "quality": 100}],
+                    "streams": [{
+                        "type": if config.video_send { "screen" } else { "video" },
+                        "rid": "100",
+                        "quality": 100,
+                    }],
                 }
             });
             client.send_raw(identify.to_string()).await?;
@@ -145,7 +149,7 @@ impl Connection {
 
         // tinycord patch: a keyframe arrives as a burst of ~100+ packets; a
         // small OS receive buffer drops some and the picture can't start.
-        let udp = if config.video_receive {
+        let udp = if config.video_receive || config.video_send {
             let socket = Socket::from(udp.into_std()?);
             if let Err(e) = socket.set_recv_buffer_size(4 * 1024 * 1024) {
                 warn!("could not enlarge UDP receive buffer: {e}");
@@ -207,10 +211,13 @@ impl Connection {
 
             let address = IpAddr::from_str(address_str).map_err(|_| Error::IllegalIp)?;
 
-            if config.video_receive {
-                crate::video_hook::SELF_SSRC
-                    .store(ready.ssrc, std::sync::atomic::Ordering::Relaxed);
-                // tinycord patch: offer Opus + H.264 (decode only).
+            if config.video_receive || config.video_send {
+                if config.video_receive {
+                    crate::video_hook::SELF_SSRC
+                        .store(ready.ssrc, std::sync::atomic::Ordering::Relaxed);
+                }
+                // tinycord patch: offer Opus + H.264 (we encode only on our
+                // own stream's connection).
                 let select = serde_json::json!({
                     "op": 1,
                     "d": {
@@ -223,7 +230,7 @@ impl Connection {
                         "codecs": [
                             {"name": "opus", "type": "audio", "priority": 1000, "payload_type": 120},
                             {"name": "H264", "type": "video", "priority": 1000, "payload_type": 103,
-                             "rtx_payload_type": 104, "encode": false, "decode": true},
+                             "rtx_payload_type": 104, "encode": config.video_send, "decode": true},
                         ],
                     }
                 });
@@ -245,7 +252,7 @@ impl Connection {
         let (cipher, dave_session, dave_protocol_version) =
             init_cipher(&mut client, &info, chosen_crypto, &ws_msg_tx).await?;
 
-        if config.video_receive {
+        if config.video_receive && !config.video_send {
             // tinycord patch: ask the server to send us video at full quality.
             client
                 .send_raw(serde_json::json!({"op": 15, "d": {"any": 100}}).to_string())
@@ -278,6 +285,22 @@ impl Connection {
         let udp_tx = udp.into_std()?;
 
         let ssrc = ready.ssrc;
+
+        if config.video_send {
+            // tinycord patch: hand tinycord a way to send its own media.
+            let sender = crate::video_hook::MediaSender::new(
+                udp_tx.try_clone()?,
+                cipher.clone(),
+                dave_session.clone(),
+                dave_protocol_version.clone(),
+                ws_msg_tx.clone(),
+                ready.ssrc,
+                crate::video_hook::take_send_ssrcs(),
+            );
+            if let Ok(mut s) = crate::video_hook::SENDER.write() {
+                *s = Some(Arc::new(sender));
+            }
+        }
 
         let mix_conn = MixerConnection {
             #[cfg(feature = "receive")]
@@ -341,7 +364,7 @@ impl Connection {
             info,
             ssrc,
             ws: ws_msg_tx,
-            video: config.video_receive,
+            video: if config.video_send { 2 } else if config.video_receive { 1 } else { 0 },
         })
     }
 

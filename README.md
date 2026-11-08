@@ -51,6 +51,33 @@ To log out, delete `%APPDATA%\tinycord\token.bin`.
   the window says so.
 - The video decoder only runs while the window is open.
 
+## Sharing your screen (Go Live)
+
+1. Join a voice channel and press **Go Live** (next to Deafen).
+2. Pick the **Screen**, **Resolution** and **FPS**, and whether to
+   **Share PC sound**.
+3. Press **Go Live**. People in the channel see the red LIVE tag next to you
+   and can watch from Discord.
+4. **Stop Live** (main window) or **Stop** (Go Live window) ends it.
+
+- **Resolution and FPS** only list what Discord allows you: without Nitro,
+  720p at 30 fps; a server with boost level 1 allows 720p 60, level 2 or 3
+  allows 1080p 60; Nitro Basic allows 1080p 60; Nitro allows any size at 60.
+  You get whichever is higher of your account and the server. Discord has
+  no setting above 60 fps.
+- You can change resolution, FPS or sound while live; viewers see a short
+  refresh.
+- **PC sound** is everything your PC plays except tinycord itself, so
+  viewers don't hear the voice chat twice. Needs Windows 10 (2004) or newer.
+- The status line shows viewers, picture size, frames per second and bitrate.
+- **Valorant:** use **Windowed Fullscreen** so the screen capture can see it.
+- The picture is encoded on your **CPU** (OpenH264). 720p 30 is light;
+  1080p 60 takes a real share of a laptop CPU, which games also want.
+- If viewers' connections drop packets, tinycord resends them and lowers
+  the bitrate a little; it raises it again when things are clean.
+- Screen capture, encoder and buffers only exist while you're live. When you
+  stop, they're freed.
+
 ## Overlay over Valorant
 
 Set Valorant's display mode to **Windowed Fullscreen**. Windows doesn't let
@@ -79,4 +106,9 @@ the game.
   decryption via `davey`, decoding with OpenH264 (built from source). Songbird
   is patched to run a viewer-only video connection (`Config::video_receive`),
   hand video packets to tinycord, and send RTCP keyframe requests.
+- Go Live sending (`src/golive.rs`): DXGI Desktop Duplication for the screen
+  (`src/capture.rs`), scaling and colour conversion (`src/convert.rs`),
+  OpenH264 encoding with packet-sized slices, RTP packetizing with
+  retransmission and sender reports (`src/rtp.rs`), DAVE encryption, and
+  WASAPI process loopback for PC sound (`src/sysaudio.rs`) encoded with Opus.
 - GitHub Actions builds the `.exe` on each push to `main`.

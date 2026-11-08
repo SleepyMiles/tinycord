@@ -3,7 +3,7 @@
 //! Text messages, presences and everything else are ignored.
 
 use crate::state::{self, state, Chan, Cmd, Guild, VoiceSt};
-use crate::{store, stream, voice};
+use crate::{golive, store, stream, voice};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use songbird::id::{ChannelId, GuildId, UserId};
@@ -277,6 +277,41 @@ async fn stop_watch(out: &mut Vec<Value>) {
     stream::stop().await;
 }
 
+async fn stop_live(out: &mut Vec<Value>) {
+    if let Some(key) = golive::stop().await {
+        out.push(json!({"op": 19, "d": {"stream_key": key}}));
+    }
+}
+
+async fn go_live(cfg: state::LiveCfg, out: &mut Vec<Value>) {
+    let (joined, ready, me, premium, boost) = {
+        let s = state();
+        let boost = s.joined.and_then(|(g, _)| s.guilds.iter().find(|x| x.id == g)).map(|g| g.boost).unwrap_or(0);
+        (s.joined, s.voice_ready, s.me, s.premium, boost)
+    };
+    let Some((g, c)) = joined else {
+        state::set_status("Join a voice channel first");
+        return;
+    };
+    if !ready {
+        state::set_status("Wait until you're connected to voice");
+        return;
+    }
+    // Only what your account or this server allows.
+    let cfg = golive::clamp(cfg, golive::allowed(premium, boost));
+    if golive::live_in(g, c).await {
+        golive::reconfigure(cfg).await;
+        return;
+    }
+    stop_live(out).await;
+    let key = stream::key_for(g, c, me);
+    golive::begin(key.clone(), g, c, cfg).await;
+    out.push(json!({"op": 18, "d": {
+        "type": "guild", "guild_id": g.to_string(), "channel_id": c.to_string(), "preferred_region": null
+    }}));
+    out.push(json!({"op": 22, "d": {"stream_key": key, "paused": false}}));
+}
+
 async fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out: &mut Vec<Value>) {
     match cmd {
         Cmd::Login(_) => {}
@@ -288,9 +323,11 @@ async fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out
         Cmd::Join(g, c) => {
             if state().joined != Some((g, c)) {
                 stop_watch(out).await;
+                stop_live(out).await;
             }
             do_join(g, c, pend, v, out);
         }
+        Cmd::Watch(_, _, u) if u == state().me => {}
         Cmd::Watch(g, c, u) => {
             let ready = {
                 let s = state();
@@ -306,8 +343,11 @@ async fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out
             }
         }
         Cmd::StopWatch => stop_watch(out).await,
+        Cmd::GoLive(cfg) => go_live(cfg, out).await,
+        Cmd::StopLive => stop_live(out).await,
         Cmd::Leave => {
             stop_watch(out).await;
+            stop_live(out).await;
             let current = state().joined.take();
             if let Some((g, _)) = current {
                 out.push(voice_state_payload(g, None));
@@ -404,7 +444,12 @@ fn parse_guild(g: &Value) -> Option<Guild> {
             learn_member(gid, m);
         }
     }
-    Some(Guild { id: gid, name, voice })
+    let boost = g["premium_tier"]
+        .as_u64()
+        .or_else(|| g["properties"]["premium_tier"].as_u64())
+        .unwrap_or(0)
+        .min(3) as u8;
+    Some(Guild { id: gid, name, voice, boost })
 }
 
 fn upsert_guild(gd: Guild) {
@@ -452,6 +497,7 @@ async fn dispatch(
             {
                 let mut s = state();
                 s.me = me;
+                s.premium = d["user"]["premium_type"].as_u64().unwrap_or(0).min(3) as u8;
                 s.names.insert(me, me_name.clone());
                 s.guilds.clear();
                 s.voice.clear();
@@ -556,6 +602,7 @@ async fn dispatch(
                     // We left, or were disconnected by someone.
                     if state().joined.map(|(g, _)| g) == Some(gid) {
                         stream::stop().await;
+                        golive::stop().await;
                         voice::disconnect(v);
                         *pend = Pending::default();
                         state().joined = None;
@@ -565,6 +612,7 @@ async fn dispatch(
                     if state().joined != Some((gid, ch)) {
                         // Moved to another channel: a stream there isn't ours.
                         stop_watch(out).await;
+                        stop_live(out).await;
                     }
                     pend.guild = gid;
                     pend.channel = ch;
@@ -594,6 +642,7 @@ async fn dispatch(
         "STREAM_CREATE" | "STREAM_SERVER_UPDATE" | "STREAM_UPDATE" | "STREAM_DELETE" => {
             tracing::info!("{t}: {}", redact(d));
             stream::on_event(t, d, pend.session_id.clone()).await;
+            golive::on_event(t, d, pend.session_id.clone()).await;
         }
         _ => {}
     }

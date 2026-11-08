@@ -1,6 +1,6 @@
 [package]
 name = "tinycord"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2021"
 
 [lints.rust]
@@ -22,11 +22,19 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi",
   "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse",
-  "Win32_UI_Controls", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_UI_HiDpi", "Win32_System_SystemServices",
+  "Win32_UI_Controls", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_UI_HiDpi", "Win32_System_SystemServices", "Win32_Media",
 ] }
 nnnoiseless = { version = "0.5.2", default-features = false }
 rubato = "0.16"
 openh264 = "0.9.9"
+
+# Screen capture (DXGI Desktop Duplication) and system-sound capture.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Gdi",
+] }
+wasapi = "0.27"
 
 [profile.release]
 opt-level = "s"

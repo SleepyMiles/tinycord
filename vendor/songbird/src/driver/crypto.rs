@@ -387,11 +387,10 @@ impl Cipher {
         Ok(())
     }
 
-    /// tinycord patch: encrypt a small hand-built RTCP packet in place for the
+    /// tinycord patch: encrypt a hand-built RTP/RTCP packet in place for the
     /// "_rtpsize" modes: the first `header_len` bytes are authenticated but
     /// sent in the clear; then the tag and the 4-byte nonce counter follow.
-    #[cfg(feature = "receive")]
-    pub(crate) fn encrypt_rtcp_raw(
+    pub(crate) fn encrypt_raw(
         &self,
         buf: &mut Vec<u8>,
         header_len: usize,
@@ -414,6 +413,39 @@ impl Cipher {
         buf.extend_from_slice(&tag);
         buf.extend_from_slice(&counter_bytes);
         Ok(())
+    }
+
+    /// tinycord patch: the inverse of [`Cipher::encrypt_raw`]. Returns the
+    /// clear header followed by the decrypted body.
+    pub(crate) fn decrypt_raw(&self, buf: &[u8], header_len: usize) -> Option<Vec<u8>> {
+        let tag_len = self.encryption_tag_len();
+        if buf.len() < header_len + tag_len + 4 {
+            return None;
+        }
+        let (header, rest) = buf.split_at(header_len);
+        let (body_tag, nonce_bytes) = rest.split_at(rest.len() - 4);
+        let (body, tag) = body_tag.split_at(body_tag.len() - tag_len);
+        let mut plain = body.to_vec();
+        let ok = match self {
+            Self::Aes256Gcm(aes_gcm) => {
+                let mut nonce = aes_gcm::Nonce::default();
+                nonce[..4].copy_from_slice(nonce_bytes);
+                aes_gcm
+                    .decrypt_in_place_detached(&nonce, header, &mut plain, tag.into())
+                    .is_ok()
+            },
+            Self::XChaCha20Poly1305(cha) => {
+                let mut nonce = chacha20poly1305::XNonce::default();
+                nonce[..4].copy_from_slice(nonce_bytes);
+                cha.decrypt_in_place_detached(&nonce, header, &mut plain, tag.into()).is_ok()
+            },
+        };
+        if !ok {
+            return None;
+        }
+        let mut out = header.to_vec();
+        out.extend_from_slice(&plain);
+        Some(out)
     }
 
     #[cfg(any(feature = "receive", test))]

@@ -20,6 +20,8 @@ pub struct Guild {
     pub id: u64,
     pub name: String,
     pub voice: Vec<Chan>,
+    /// Server boost level 0-3 (raises Go Live quality for everyone).
+    pub boost: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -38,6 +40,40 @@ pub struct Watching {
     pub user: u64,
     pub name: String,
     pub status: String,
+}
+
+/// Go Live settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveCfg {
+    /// Index into the monitor list (usize::MAX = the main screen).
+    pub monitor: usize,
+    /// Picture height (480, 720, 1080, 1440), 0 = your screen's own size.
+    pub height: u32,
+    pub fps: u32,
+    /// Also send what your PC is playing.
+    pub sound: bool,
+}
+
+impl Default for LiveCfg {
+    fn default() -> Self {
+        Self { monitor: usize::MAX, height: 720, fps: 30, sound: true }
+    }
+}
+
+/// Our own stream while it's on.
+#[derive(Clone, Debug, Default)]
+pub struct Live {
+    pub guild: u64,
+    pub channel: u64,
+    pub status: String,
+    pub viewers: usize,
+    /// What's actually going out: picture size, frames/s, kbit/s.
+    pub w: u32,
+    pub h: u32,
+    pub fps: u32,
+    pub kbps: u32,
+    /// A problem with PC sound (the picture still goes out).
+    pub sound_note: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +97,11 @@ pub struct State {
     /// the channel we asked to be in
     pub joined: Option<(u64, u64)>,
     pub watching: Option<Watching>,
+    /// Our Go Live stream, while it's on.
+    pub live: Option<Live>,
+    pub live_cfg: LiveCfg,
+    /// Nitro: 0 none, 1 Classic, 2 Nitro, 3 Basic.
+    pub premium: u8,
     pub voice_ready: bool,
     pub speaking: HashSet<u64>,
     pub self_talking: bool,
@@ -131,6 +172,9 @@ fn cell() -> &'static Mutex<State> {
             nicks: HashMap::new(),
             joined: None,
             watching: None,
+            live: None,
+            live_cfg: LiveCfg::default(),
+            premium: 0,
             voice_ready: false,
             speaking: HashSet::new(),
             self_talking: false,
@@ -163,6 +207,9 @@ pub enum Cmd {
     /// Watch (guild, channel, streamer)'s Go Live stream.
     Watch(u64, u64, u64),
     StopWatch,
+    /// Share your screen in the channel you're in (or apply new settings).
+    GoLive(LiveCfg),
+    StopLive,
 }
 
 static CMD: OnceLock<UnboundedSender<Cmd>> = OnceLock::new();
