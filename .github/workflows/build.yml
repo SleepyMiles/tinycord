@@ -17,6 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # NASM lets OpenH264 (the Go Live video encoder) use its fast
+      # assembly code; without it the build silently falls back to plain C.
+      - uses: ilammy/setup-nasm@v1
+      - name: Check NASM
+        run: nasm -v
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release
