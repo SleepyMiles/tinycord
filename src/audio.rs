@@ -58,6 +58,13 @@ pub struct Shared {
     pub gate_open: AtomicBool,
     /// Set once the fade-out has reached silence.
     pub faded_out: AtomicBool,
+    /// RNNoise strength 0.1..=1.0 when on (f32 bits). Lower = more of your
+    /// natural voice kept, fewer "processed"/watery artifacts.
+    pub ns_strength: AtomicU32,
+    /// Gentle presence boost for clearer speech.
+    pub clarity: AtomicBool,
+    /// When the raw mic last hit full scale (ms since epoch), 0 = never.
+    pub last_clip_ms: AtomicU64,
 }
 
 impl Shared {
@@ -76,6 +83,9 @@ impl Shared {
             vad_level: AtomicU32::new((-100f32).to_bits()),
             gate_open: AtomicBool::new(false),
             faded_out: AtomicBool::new(true),
+            ns_strength: AtomicU32::new(0.8f32.to_bits()),
+            clarity: AtomicBool::new(false),
+            last_clip_ms: AtomicU64::new(0),
         })
     }
 
@@ -187,27 +197,44 @@ impl Converter {
     }
 }
 
-/// Second-order high-pass at 80 Hz: removes breath rumble, pops and desk
-/// thumps that muddy speech and fool the auto gain. Voice is unaffected.
-struct HighPass {
+/// Second-order filter (RBJ cookbook). Used for the 80 Hz high-pass (removes
+/// breath rumble, pops and desk thumps) and the optional clarity shelf.
+struct Biquad {
     b: [f32; 3],
     a: [f32; 2],
     x: [f32; 2],
     y: [f32; 2],
 }
 
-impl HighPass {
-    fn new(cutoff: f32, rate: f32) -> Self {
+impl Biquad {
+    fn from(b: [f32; 3], a0: f32, a1: f32, a2: f32) -> Self {
+        Self { b: [b[0] / a0, b[1] / a0, b[2] / a0], a: [a1 / a0, a2 / a0], x: [0.0; 2], y: [0.0; 2] }
+    }
+
+    fn high_pass(cutoff: f32, rate: f32) -> Self {
         let w0 = 2.0 * std::f32::consts::PI * cutoff / rate;
         let alpha = w0.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2);
         let c = w0.cos();
-        let a0 = 1.0 + alpha;
-        Self {
-            b: [(1.0 + c) / 2.0 / a0, -(1.0 + c) / a0, (1.0 + c) / 2.0 / a0],
-            a: [-2.0 * c / a0, (1.0 - alpha) / a0],
-            x: [0.0; 2],
-            y: [0.0; 2],
-        }
+        Self::from([(1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0], 1.0 + alpha, -2.0 * c, 1.0 - alpha)
+    }
+
+    /// Boost (or cut) everything above `freq` by `db`.
+    fn high_shelf(freq: f32, db: f32, rate: f32) -> Self {
+        let a = 10f32.powf(db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * freq / rate;
+        let (sn, c) = (w0.sin(), w0.cos());
+        let alpha = sn / 2.0 * 2f32.sqrt(); // shelf slope S = 1
+        let sa = 2.0 * a.sqrt() * alpha;
+        Self::from(
+            [
+                a * ((a + 1.0) + (a - 1.0) * c + sa),
+                -2.0 * a * ((a - 1.0) + (a + 1.0) * c),
+                a * ((a + 1.0) + (a - 1.0) * c - sa),
+            ],
+            (a + 1.0) - (a - 1.0) * c + sa,
+            2.0 * ((a - 1.0) - (a + 1.0) * c),
+            (a + 1.0) - (a - 1.0) * c - sa,
+        )
     }
 
     fn run(&mut self, v: f32) -> f32 {
@@ -217,6 +244,48 @@ impl HighPass {
         self.x = [v, self.x[0]];
         self.y = [y, self.y[0]];
         y
+    }
+}
+
+/// Voice leveler (compressor): evens out loud and soft syllables smoothly,
+/// so the voice can be louder overall without the limiter squashing peaks.
+/// 3:1 above -22 dBFS with a soft knee, 5 ms attack, 150 ms release, +5 dB
+/// makeup.
+struct Compressor {
+    env: f32,
+    gr_db: f32,
+    c_env: f32,
+    c_att: f32,
+    c_rel: f32,
+}
+
+impl Compressor {
+    const THRESHOLD: f32 = -22.0;
+    const RATIO: f32 = 3.0;
+    const KNEE: f32 = 6.0;
+    const MAKEUP: f32 = 5.0;
+
+    fn new(rate: f32) -> Self {
+        let c = |sec: f32| 1.0 - (-1.0 / (sec * rate)).exp();
+        Self { env: 0.0, gr_db: 0.0, c_env: c(0.010), c_att: c(0.005), c_rel: c(0.150) }
+    }
+
+    /// Gain (linear) to apply to sample `x`.
+    fn gain(&mut self, x: f32) -> f32 {
+        self.env += (x * x - self.env) * self.c_env;
+        let lvl = 10.0 * (self.env + 1e-12).log10();
+        let over = lvl - Self::THRESHOLD;
+        let slope = 1.0 / Self::RATIO - 1.0;
+        let want = if over <= -Self::KNEE / 2.0 {
+            0.0
+        } else if over < Self::KNEE / 2.0 {
+            slope * (over + Self::KNEE / 2.0).powi(2) / (2.0 * Self::KNEE)
+        } else {
+            slope * over
+        };
+        let c = if want < self.gr_db { self.c_att } else { self.c_rel };
+        self.gr_db += (want - self.gr_db) * c;
+        10f32.powf((self.gr_db + Self::MAKEUP) / 20.0)
     }
 }
 
@@ -290,7 +359,12 @@ struct MicProcessor {
     /// need turning down to stay under the ceiling.
     delay: VecDeque<(f32, f32)>,
     limit: f32,
-    hpf: HighPass,
+    hpf: Biquad,
+    shelf: Biquad,
+    comp: Compressor,
+    /// Last input frame, to blend with RNNoise's output (which is one
+    /// frame behind) when strength < 100%.
+    prev_in: [f32; DenoiseState::FRAME_SIZE],
 }
 
 /// Limiter look-ahead (2 ms) and ceiling.
@@ -309,7 +383,10 @@ impl MicProcessor {
             speech_pow: 0.0,
             delay: VecDeque::with_capacity(LOOKAHEAD + 1),
             limit: 1.0,
-            hpf: HighPass::new(80.0, RATE as f32),
+            hpf: Biquad::high_pass(80.0, RATE as f32),
+            shelf: Biquad::high_shelf(3000.0, 4.0, RATE as f32),
+            comp: Compressor::new(RATE as f32),
+            prev_in: [0.0; DenoiseState::FRAME_SIZE],
         }
     }
 
@@ -335,15 +412,28 @@ impl MicProcessor {
                 *d = s * 32768.0;
             }
             let vad_prob = if ns_on {
-                self.ns.process_frame(&mut self.frame_out, &self.frame_in)
+                let p = self.ns.process_frame(&mut self.frame_out, &self.frame_in);
+                // Keep some of the natural voice: full-strength suppression
+                // is what sounds watery/"processed".
+                let k = f32::from_bits(shared.ns_strength.load(Ordering::Relaxed)).clamp(0.0, 1.0);
+                if k < 0.999 {
+                    for (o, d) in self.frame_out.iter_mut().zip(self.prev_in.iter()) {
+                        *o = *o * k + *d * (1.0 - k);
+                    }
+                }
+                p
             } else {
                 self.frame_out.copy_from_slice(&self.frame_in);
                 1.0
             };
+            self.prev_in.copy_from_slice(&self.frame_in);
+            let clarity = shared.clarity.load(Ordering::Relaxed);
 
             let mut sum = 0f32;
             for s in self.frame_out.iter_mut() {
-                *s = self.hpf.run(*s / 32768.0);
+                let v = self.hpf.run(*s / 32768.0);
+                let shelved = self.shelf.run(v);
+                *s = if clarity { shelved } else { v };
                 sum += *s * *s;
             }
             let pow = sum / N as f32;
@@ -389,6 +479,8 @@ impl MicProcessor {
             for (i, s) in self.frame_out.iter().enumerate() {
                 let g = from + (to - from) * (i + 1) as f32 / N as f32;
                 let x = s * g;
+                // The leveler only runs with auto gain (it's part of it).
+                let x = if agc_on { x * self.comp.gain(x) } else { x };
                 let need = if x.abs() > CEILING { CEILING / x.abs() } else { 1.0 };
                 self.delay.push_back((x, need));
                 // Look-ahead limiter: start turning down 2 ms before a peak
@@ -649,6 +741,9 @@ fn build_input(dev: &cpal::Device, shared: Arc<Shared>) -> Option<cpal::Stream> 
     let mut proc = MicProcessor::new();
     let mut downmix = Downmix::new(ch);
     let mut handle = move |data: &[f32]| {
+        if data.iter().filter(|x| x.abs() >= 0.99).count() >= 3 {
+            shared.last_clip_ms.store(shared.now_ms().max(1), Ordering::Relaxed);
+        }
         downmix.run(data, &mut mono);
         let backlog = shared.mic.lock().len();
         rs.set_fast(backlog > MIC_CATCHUP);
@@ -990,13 +1085,48 @@ mod tests {
     #[test]
     fn high_pass_removes_rumble_keeps_voice() {
         let gain_at = |f: f32| {
-            let mut h = HighPass::new(80.0, 48_000.0);
+            let mut h = Biquad::high_pass(80.0, 48_000.0);
             let out: Vec<f32> = (0..48_000).map(|i| h.run((i as f32 * f * 6.283 / 48_000.0).sin())).collect();
             (out[24_000..].iter().map(|x| x * x).sum::<f32>() / 24_000.0 * 2.0).sqrt()
         };
         let (rumble, voice) = (gain_at(25.0), gain_at(300.0));
         println!("high-pass: 25 Hz kept {:.0}%, 300 Hz kept {:.0}%", rumble * 100.0, voice * 100.0);
         assert!(rumble < 0.15 && voice > 0.95);
+    }
+
+    #[test]
+    fn clarity_boosts_presence_only() {
+        let gain_at = |f: f32| {
+            let mut h = Biquad::high_shelf(3000.0, 4.0, 48_000.0);
+            let out: Vec<f32> = (0..48_000).map(|i| h.run((i as f32 * f * 6.283 / 48_000.0).sin())).collect();
+            20.0 * ((out[24_000..].iter().map(|x| x * x).sum::<f32>() / 24_000.0 * 2.0).sqrt()).log10()
+        };
+        let (low, high) = (gain_at(300.0), gain_at(6000.0));
+        println!("clarity: 300 Hz {low:+.1} dB, 6 kHz {high:+.1} dB");
+        assert!(low.abs() < 0.5 && (high - 4.0).abs() < 0.7);
+    }
+
+    /// Loud and soft syllables: the leveler should bring them closer
+    /// together (so the voice is louder overall without squashed peaks).
+    #[test]
+    fn leveler_evens_out_syllables() {
+        let mut c = Compressor::new(48_000.0);
+        let mut level = |amp: f32| {
+            let mut sum = 0f32;
+            for i in 0..9_600 {
+                let x = amp * (i as f32 * 200.0 * 6.283 / 48_000.0).sin();
+                let y = x * c.gain(x);
+                if i >= 4_800 {
+                    sum += y * y;
+                }
+            }
+            10.0 * (sum / 4_800.0).log10()
+        };
+        let soft = level(0.03);
+        let loud = level(0.5);
+        let in_gap = 20.0 * (0.5f32 / 0.03).log10();
+        println!("leveler: input gap {in_gap:.1} dB -> output gap {:.1} dB", loud - soft);
+        assert!(loud - soft < in_gap - 6.0);
     }
 
     #[test]

@@ -37,6 +37,7 @@ const ID_AGC: i32 = 115;
 const ID_MIC: i32 = 116;
 const ID_SPKDEV: i32 = 117;
 const ID_VOL: i32 = 118;
+const ID_NSLVL: i32 = 119;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_TOPMOST: usize = 2;
@@ -70,7 +71,7 @@ struct Row {
 struct Ui {
     hwnd: HWND,
     overlay: HWND,
-    c: [HWND; 19],
+    c: [HWND; 20],
     font: HFONT,
     bold: HFONT,
     ofont: HFONT,
@@ -215,7 +216,7 @@ pub fn run() {
             *u.borrow_mut() = Some(Ui {
                 hwnd: null_mut(),
                 overlay: null_mut(),
-                c: [null_mut(); 19],
+                c: [null_mut(); 20],
                 font: make_font(dpi, 9, FW_NORMAL as i32),
                 bold: make_font(dpi, 9, FW_BOLD as i32),
                 ofont: make_font(dpi, 11, FW_SEMIBOLD as i32),
@@ -330,7 +331,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let cbo = |x, y, w, id| {
         child(hwnd, "COMBOBOX", "", ts | WS_VSCROLL | CBS_DROPDOWNLIST as u32, x, y, w, 300, id, dpi, font)
     };
-    let mut c = [null_mut(); 19];
+    let mut c = [null_mut(); 20];
     c[0] = child(hwnd, "STATIC", "Starting...", SS_LEFT as u32 | SS_ENDELLIPSIS as u32, 6, 6, 268, 18, ID_STATUS, dpi, font);
     c[1] = child(hwnd, "EDIT", "", ts | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32, 6, 28, 190, 24, ID_TOKEN, dpi, font);
     c[2] = b("Log in", BS_PUSHBUTTON, 202, 28, 72, 24, ID_LOGIN);
@@ -343,21 +344,22 @@ unsafe fn create_controls(hwnd: HWND) {
         6,
         58,
         268,
-        226,
+        200,
         ID_LIST,
         dpi,
         font,
     );
-    c[5] = b("Join", BS_PUSHBUTTON, 6, 290, 86, 26, ID_JOIN);
-    c[6] = b("Mute", BS_AUTOCHECKBOX | BS_PUSHLIKE, 97, 290, 86, 26, ID_MUTE);
-    c[7] = b("Deafen", BS_AUTOCHECKBOX | BS_PUSHLIKE, 188, 290, 86, 26, ID_DEAF);
-    c[8] = cbo(6, 322, 130, ID_MODE);
-    c[9] = b("PTT key: not set", BS_PUSHBUTTON, 142, 321, 132, 25, ID_KEY);
-    c[10] = child(hwnd, "tinycord_slider", "", 0, 6, 352, 268, 22, ID_SENS, dpi, font);
-    c[18] = child(hwnd, "tinycord_slider", "", 0, 6, 378, 268, 22, ID_VOL, dpi, font);
+    c[5] = b("Join", BS_PUSHBUTTON, 6, 264, 86, 26, ID_JOIN);
+    c[6] = b("Mute", BS_AUTOCHECKBOX | BS_PUSHLIKE, 97, 264, 86, 26, ID_MUTE);
+    c[7] = b("Deafen", BS_AUTOCHECKBOX | BS_PUSHLIKE, 188, 264, 86, 26, ID_DEAF);
+    c[8] = cbo(6, 296, 130, ID_MODE);
+    c[9] = b("PTT key: not set", BS_PUSHBUTTON, 142, 295, 132, 25, ID_KEY);
+    c[10] = child(hwnd, "tinycord_slider", "", 0, 6, 326, 268, 22, ID_SENS, dpi, font);
+    c[18] = child(hwnd, "tinycord_slider", "", 0, 6, 352, 268, 22, ID_VOL, dpi, font);
+    c[19] = child(hwnd, "tinycord_slider", "", 0, 6, 378, 268, 22, ID_NSLVL, dpi, font);
     c[11] = cbo(6, 406, 130, ID_OVERLAY);
     c[12] = b("Speakers only", BS_AUTOCHECKBOX, 144, 406, 128, 22, ID_SPK);
-    c[14] = b("Noise suppression", BS_AUTOCHECKBOX, 8, 432, 128, 22, ID_NS);
+    c[14] = b("Clarity boost", BS_AUTOCHECKBOX, 8, 432, 128, 22, ID_NS);
     c[15] = b("Auto gain", BS_AUTOCHECKBOX, 144, 432, 128, 22, ID_AGC);
     c[13] = b("Keep on top", BS_AUTOCHECKBOX, 8, 456, 128, 22, ID_TOP);
     c[16] = cbo(6, 480, 130, ID_MIC);
@@ -379,7 +381,7 @@ unsafe fn create_controls(hwnd: HWND) {
     SendMessageW(c[12], BM_SETCHECK, s.overlay_speakers_only as usize, 0);
     drop(s);
     let sh = crate::voice::shared();
-    SendMessageW(c[14], BM_SETCHECK, sh.noise_suppression.load(Ordering::Relaxed) as usize, 0);
+    SendMessageW(c[14], BM_SETCHECK, sh.clarity.load(Ordering::Relaxed) as usize, 0);
     SendMessageW(c[15], BM_SETCHECK, sh.auto_gain.load(Ordering::Relaxed) as usize, 0);
 
     with_ui(|u| {
@@ -511,7 +513,7 @@ unsafe fn on_command(id: i32, code: u32) {
         }
         (ID_NS, BN_CLICKED) => {
             let on = SendMessageW(c[14], BM_GETCHECK, 0, 0) == 1;
-            crate::voice::shared().noise_suppression.store(on, Ordering::Relaxed);
+            crate::voice::shared().clarity.store(on, Ordering::Relaxed);
             store::save_settings();
         }
         (ID_AGC, BN_CLICKED) => {
@@ -532,7 +534,7 @@ unsafe fn on_command(id: i32, code: u32) {
             if krisp {
                 // Krisp already cleans the audio; doing it twice sounds worse.
                 crate::voice::shared().noise_suppression.store(false, Ordering::Relaxed);
-                SendMessageW(c[14], BM_SETCHECK, 0, 0);
+                InvalidateRect(c[19], null(), 0);
             }
             store::save_settings();
             state::send(Cmd::RestartAudio);
@@ -572,7 +574,10 @@ unsafe fn mic_meter(hwnd: HWND) {
     let title = if in_voice {
         let db = f32::from_bits(crate::voice::shared().mic_level.load(Ordering::Relaxed));
         let bars = (((db + 60.0) / 6.0).clamp(0.0, 10.0)) as usize;
-        let gain = f32::from_bits(crate::voice::shared().agc_gain.load(Ordering::Relaxed));
+        let sh = crate::voice::shared();
+        let gain = f32::from_bits(sh.agc_gain.load(Ordering::Relaxed));
+        let clip = sh.last_clip_ms.load(Ordering::Relaxed);
+        let clipping = clip != 0 && sh.now_ms().saturating_sub(clip) < 2000;
         format!(
             "tinycord  mic {}{} {:.0} dB  x{:.1}{}",
             "\u{2588}".repeat(bars),
@@ -580,7 +585,7 @@ unsafe fn mic_meter(hwnd: HWND) {
             db.max(-99.0),
             gain,
             if talking { "  SENDING" } else { "" }
-        )
+        ) + if clipping { "  MIC CLIPPING - lower Windows mic level" } else { "" }
     } else {
         "tinycord".to_string()
     };
@@ -763,17 +768,12 @@ unsafe fn refresh() {
     EnableWindow(c[9], (mode == MicMode::Ptt || key_txt.starts_with("Press")) as i32);
 
     update_devices(&c);
-    SendMessageW(
-        c[14],
-        BM_SETCHECK,
-        crate::voice::shared().noise_suppression.load(Ordering::Relaxed) as usize,
-        0,
-    );
+    InvalidateRect(c[19], null(), 0);
 
     update_overlay();
 }
 
-unsafe fn update_devices(c: &[HWND; 19]) {
+unsafe fn update_devices(c: &[HWND; 20]) {
     let (ins, outs, mic, spk) = {
         let s = state();
         (s.input_devices.clone(), s.output_devices.clone(), s.mic_device.clone(), s.spk_device.clone())
@@ -884,9 +884,17 @@ unsafe fn slider_set_from_x(hwnd: HWND, x: i32) {
     let (l, r) = slider_bar(dpi, rc.right);
     let frac = ((x - l) as f32 / (r - l).max(1) as f32).clamp(0.0, 1.0);
     let sh = crate::voice::shared();
-    if GetDlgCtrlID(hwnd) == ID_SENS {
+    let id = GetDlgCtrlID(hwnd);
+    if id == ID_SENS {
         let db = SENS_MIN_DB + frac * -SENS_MIN_DB;
         sh.vad_db.store(db.round().to_bits(), Ordering::Relaxed);
+    } else if id == ID_NSLVL {
+        // 0% = off; otherwise RNNoise at that strength.
+        let k = (frac * 20.0).round() / 20.0; // 5% steps
+        sh.noise_suppression.store(k > 0.0, Ordering::Relaxed);
+        if k > 0.0 {
+            sh.ns_strength.store(k.to_bits(), Ordering::Relaxed);
+        }
     } else {
         let mut v = frac * 2.0;
         if (v - 1.0).abs() < 0.04 {
@@ -937,7 +945,8 @@ unsafe extern "system" fn slider_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             SetTextColor(mem, rgb(30, 30, 30));
 
             let sh = crate::voice::shared();
-            let is_sens = GetDlgCtrlID(hwnd) == ID_SENS;
+            let id = GetDlgCtrlID(hwnd);
+            let is_sens = id == ID_SENS;
             let (l, r) = slider_bar(dpi, rc.right);
             let bh = sc(dpi, 10);
             let top = (rc.bottom - bh) / 2;
@@ -958,6 +967,11 @@ unsafe extern "system" fn slider_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     fill(l, l + ((r - l) as f32 * lf) as i32, color);
                 }
                 ("Sensitivity", format!("{:.0} dB", thr), (thr - SENS_MIN_DB) / -SENS_MIN_DB)
+            } else if id == ID_NSLVL {
+                let on = sh.noise_suppression.load(Ordering::Relaxed);
+                let k = if on { f32::from_bits(sh.ns_strength.load(Ordering::Relaxed)) } else { 0.0 };
+                fill(l, l + ((r - l) as f32 * k) as i32, rgb(140, 100, 200));
+                ("Noise removal", if on { format!("{:.0}%", k * 100.0) } else { "off".into() }, k)
             } else {
                 let v = f32::from_bits(sh.input_volume.load(Ordering::Relaxed));
                 fill(l, l + ((r - l) as f32 * v / 2.0) as i32, rgb(70, 130, 220));
