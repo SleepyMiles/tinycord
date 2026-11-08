@@ -32,7 +32,8 @@ jobs:
       - name: Check the video encoder was built with NASM
         shell: bash
         run: |
-          out=$(cat target/release/build/openh264-sys2-*/output)
+          out=$(cat target/release/build/openh264-sys2-*/output 2>/dev/null || true)
+          [ -n "$out" ] || { echo "OpenH264 build output not found"; exit 1; }
           if echo "$out" | grep -qiE "not using any assembly|NASM compilation disabled"; then
             echo "$out"; echo "OpenH264 was built WITHOUT assembly"; exit 1
           fi
