@@ -17,6 +17,7 @@ const ID_MON: i32 = 201;
 const ID_RES: i32 = 202;
 const ID_FPS: i32 = 203;
 const ID_SOUND: i32 = 204;
+const ID_QUALITY: i32 = 208;
 const ID_GO: i32 = 205;
 const ID_NOTE: i32 = 206;
 const ID_STATUS: i32 = 207;
@@ -27,6 +28,7 @@ struct LiveUi {
     res: HWND,
     fps: HWND,
     sound: HWND,
+    quality: HWND,
     go: HWND,
     note: HWND,
     status: HWND,
@@ -83,7 +85,7 @@ pub unsafe fn open() {
     }
     let Some((main, _, dpi)) = main_info() else { return };
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    let mut r = RECT { left: 0, top: 0, right: sc(dpi, 280), bottom: sc(dpi, 214) };
+    let mut r = RECT { left: 0, top: 0, right: sc(dpi, 280), bottom: sc(dpi, 244) };
     AdjustWindowRect(&mut r, style, 0);
     let mut mr: RECT = std::mem::zeroed();
     GetWindowRect(main, &mut mr);
@@ -121,10 +123,13 @@ unsafe fn build(hwnd: HWND) {
     let res = cbo(80, 38, 92, ID_RES);
     label("FPS", 182, 41, 30);
     let fps = cbo(212, 38, 60, ID_FPS);
-    let sound = child(hwnd, "BUTTON", "Share PC sound", ts | BS_AUTOCHECKBOX as u32, 10, 68, 200, 20, ID_SOUND, dpi, font);
-    let note = child(hwnd, "STATIC", "", SS_LEFT as u32, 8, 92, 264, 48, ID_NOTE, dpi, font);
-    let go = child(hwnd, "BUTTON", "Go Live", ts | BS_DEFPUSHBUTTON as u32, 8, 144, 264, 30, ID_GO, dpi, font);
-    let status = child(hwnd, "STATIC", "", SS_LEFT as u32, 8, 180, 264, 32, ID_STATUS, dpi, font);
+    label("Quality", 8, 71, 70);
+    let quality = cbo(80, 68, 192, ID_QUALITY);
+    let sound = child(hwnd, "BUTTON", "Share PC sound", ts | BS_AUTOCHECKBOX as u32, 10, 98, 200, 20, ID_SOUND, dpi, font);
+    let note = child(hwnd, "STATIC", "", SS_LEFT as u32, 8, 122, 264, 48, ID_NOTE, dpi, font);
+    let go = child(hwnd, "BUTTON", "Go Live", ts | BS_DEFPUSHBUTTON as u32, 8, 174, 264, 30, ID_GO, dpi, font);
+    let status = child(hwnd, "STATIC", "", SS_LEFT as u32, 8, 210, 264, 32, ID_STATUS, dpi, font);
+    combo_add(quality, &["Standard", "High (sharper)", "Ultra (needs fast upload)"]);
 
     let monitors = crate::capture::monitors();
     let names: Vec<String> = if monitors.is_empty() {
@@ -141,6 +146,7 @@ unsafe fn build(hwnd: HWND) {
             res,
             fps,
             sound,
+            quality,
             go,
             note,
             status,
@@ -155,6 +161,7 @@ unsafe fn build(hwnd: HWND) {
     let m = with(|l| crate::capture::resolve(cfg.monitor, &l.monitors)).unwrap_or(0).min(names.len() - 1);
     SendMessageW(mon, CB_SETCURSEL, m, 0);
     SendMessageW(sound, BM_SETCHECK, cfg.sound as usize, 0);
+    SendMessageW(quality, CB_SETCURSEL, cfg.quality.min(2) as usize, 0);
     fill_options();
     update();
 }
@@ -203,16 +210,30 @@ unsafe fn fill_options() {
     let fi = fps_items.iter().position(|f| *f == cfg.fps).unwrap_or(fps_items.len().saturating_sub(1));
     SendMessageW(res, CB_SETCURSEL, ri, 0);
     SendMessageW(fps, CB_SETCURSEL, fi, 0);
-    let note = format!(
-        "Allowed here: up to {} at {} fps (your Nitro or this server's boost level).\nEncoding uses your CPU; 1080p 60 needs a fast one.",
-        if max_h == 0 { "any size".to_string() } else { format!("{max_h}p") },
-        max_fps
-    );
     with(|l| {
-        set_text(l.note, &note);
         l.res_items = res_items;
         l.fps_items = fps_items;
     });
+    update_note();
+}
+
+/// What's allowed, and how much upload the chosen settings use.
+unsafe fn update_note() {
+    let Some(cfg) = read_cfg() else { return };
+    let Some((note, allowed, mon)) = with(|l| (l.note, l.allowed, l.monitors.get(cfg.monitor).map(|m| (m.w, m.h)))) else {
+        return;
+    };
+    let (mw, mh) = mon.unwrap_or((1920, 1080));
+    let (w, h) = crate::convert::target_size(mw as usize, mh as usize, cfg.height as usize);
+    let mbps = golive::target_bitrate(w as u32, h as u32, cfg.fps, cfg.quality) as f64 / 1e6;
+    let (max_h, max_fps) = allowed;
+    let text = format!(
+        "Allowed here: up to {} at {} fps (your Nitro or the server's boost).\nUses about {:.1} Mbit/s of upload.",
+        if max_h == 0 { "any size".to_string() } else { format!("{max_h}p") },
+        max_fps,
+        mbps
+    );
+    set_text(note, &text);
 }
 
 /// Settings as shown in the window.
@@ -225,6 +246,7 @@ unsafe fn read_cfg() -> Option<LiveCfg> {
             height: l.res_items.get(ri).copied().unwrap_or(720),
             fps: l.fps_items.get(fi).copied().unwrap_or(30),
             sound: SendMessageW(l.sound, BM_GETCHECK, 0, 0) == 1,
+            quality: SendMessageW(l.quality, CB_GETCURSEL, 0, 0).clamp(0, 2) as u8,
         }
     })
 }
@@ -296,7 +318,11 @@ unsafe extern "system" fn proc_(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     fill_options();
                     settings_changed();
                 }
-                (ID_RES | ID_FPS, CBN_SELCHANGE) | (ID_SOUND, BN_CLICKED) => settings_changed(),
+                (ID_RES | ID_FPS | ID_QUALITY, CBN_SELCHANGE) => {
+                    update_note();
+                    settings_changed();
+                }
+                (ID_SOUND, BN_CLICKED) => settings_changed(),
                 (ID_GO, BN_CLICKED) => {
                     if state().live.is_some() {
                         state::send(Cmd::StopLive);

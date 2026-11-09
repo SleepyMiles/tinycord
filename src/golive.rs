@@ -65,12 +65,24 @@ pub fn clamp(mut cfg: LiveCfg, (max_h, max_fps): (u32, u32)) -> LiveCfg {
     if !FPS.contains(&cfg.fps) {
         cfg.fps = 30;
     }
+    cfg.quality = cfg.quality.min(QUALITY.len() as u8 - 1);
     cfg.fps = cfg.fps.min(max_fps);
     cfg
 }
 
-/// Bits per second for a picture size and frame rate (screen content with
-/// text needs more than camera video).
+/// Quality choices: name and how much more bitrate than Standard.
+pub const QUALITY: [(&str, f64); 3] = [("Standard", 1.0), ("High", 1.6), ("Ultra", 2.2)];
+
+/// Bitrate for a picture size, frame rate and quality choice. Bitrate is
+/// what makes 1080p look sharp: in tests, High (1.6x) gave about 5 dB
+/// better picture than Standard, while encoder effort settings barely
+/// mattered.
+pub fn target_bitrate(w: u32, h: u32, fps: u32, quality: u8) -> u32 {
+    let mult = QUALITY[(quality as usize).min(QUALITY.len() - 1)].1;
+    (bitrate(w, h, fps) as f64 * mult).min(25_000_000.0) as u32
+}
+
+/// Standard-quality bits per second for a picture size and frame rate.
 pub fn bitrate(w: u32, h: u32, fps: u32) -> u32 {
     let px = (w as f64 * h as f64).max(1.0);
     // ~2.5 Mbit/s for 720p30, growing a bit slower than the pixel count.
@@ -318,6 +330,7 @@ struct Shared {
     /// Encoder bitrate the send thread wants (lowered when packets get lost).
     bitrate: AtomicU32,
     fps: u32,
+    quality: u8,
     /// Last picture size (w << 16 | h).
     size: AtomicU32,
     frames: AtomicU32,
@@ -436,6 +449,7 @@ impl Pipeline {
             nacks: Mutex::new(Vec::new()),
             bitrate: AtomicU32::new(0),
             fps: cfg.fps,
+            quality: cfg.quality,
             size: AtomicU32::new(0),
             frames: AtomicU32::new(0),
             bytes: AtomicU64::new(0),
@@ -466,7 +480,7 @@ impl Pipeline {
             "rtx_ssrc": rtx_ssrc,
             "streams": [{
                 "type": "video", "rid": "100", "ssrc": video_ssrc, "active": true, "quality": 100,
-                "rtx_ssrc": rtx_ssrc, "max_bitrate": bitrate(w as u32, h as u32, cfg.fps) * 2,
+                "rtx_ssrc": rtx_ssrc, "max_bitrate": target_bitrate(w as u32, h as u32, cfg.fps, cfg.quality) * 2,
                 "max_framerate": cfg.fps,
                 "max_resolution": {"type": "fixed", "width": w, "height": h}
             }]
@@ -722,7 +736,7 @@ fn encode_thread(
         let size = ((w as u32) << 16) | h as u32;
         if sh.size.swap(size, Ordering::Relaxed) != size {
             // New picture size: start from that size's normal bitrate.
-            sh.bitrate.store(bitrate(w as u32, h as u32, cfg.fps), Ordering::Relaxed);
+            sh.bitrate.store(target_bitrate(w as u32, h as u32, cfg.fps, cfg.quality), Ordering::Relaxed);
         }
         let want = sh.bitrate.load(Ordering::Relaxed);
         let rebuild = match &enc {
@@ -981,7 +995,7 @@ fn adapt(sh: &Shared, loss_avg: &mut f64, last_change: &mut Instant, clean_since
     if size == 0 {
         return;
     }
-    let full = bitrate(size >> 16, size & 0xffff, sh.fps);
+    let full = target_bitrate(size >> 16, size & 0xffff, sh.fps, sh.quality);
     let remb = sh.remb.load(Ordering::Relaxed);
     let mut want = cur;
     if *loss_avg > 0.10 {
@@ -992,7 +1006,9 @@ fn adapt(sh: &Shared, loss_avg: &mut f64, last_change: &mut Instant, clean_since
     } else if clean_since.elapsed() > Duration::from_secs(20) {
         want = ((cur as f64 * 1.15) as u32).min(full);
     }
-    if remb > 100_000 && (want as u64) > remb * 9 / 10 {
+    // The server's bandwidth estimate only counts when packets are really
+    // being lost; on its own it can sit far below what the connection does.
+    if *loss_avg > 0.02 && remb > 100_000 && (want as u64) > remb * 9 / 10 {
         want = (remb * 9 / 10) as u32;
     }
     let floor = (full / 3).max(500_000);
@@ -1084,9 +1100,11 @@ mod tests {
         assert_eq!(allowed(3, 0), (1080, 60));
         assert_eq!(allowed(2, 0), (0, 60));
         assert_eq!(allowed(2, 3), (0, 60));
-        let c = clamp(LiveCfg { monitor: 0, height: 1440, fps: 60, sound: true }, allowed(0, 0));
+        let c = clamp(LiveCfg { monitor: 0, height: 1440, fps: 60, sound: true, quality: 1 }, allowed(0, 0));
         assert_eq!((c.height, c.fps), (720, 30));
-        let c = clamp(LiveCfg { monitor: 0, height: 0, fps: 60, sound: true }, allowed(0, 2));
+        let c = clamp(LiveCfg { monitor: 0, height: 0, fps: 60, sound: true, quality: 9 }, allowed(0, 2));
+        assert_eq!(c.quality, 2);
+        assert!(target_bitrate(1920, 1080, 60, 1) > bitrate(1920, 1080, 60));
         assert_eq!((c.height, c.fps), (1080, 60));
         assert!(bitrate(1280, 720, 30) > 2_000_000 && bitrate(1920, 1080, 60) > bitrate(1920, 1080, 30));
     }
@@ -1308,7 +1326,7 @@ mod clock {
     #[test]
     fn steady_ticks() {
         let fps = 30;
-        let cfg = LiveCfg { monitor: 0, height: 480, fps, sound: false };
+        let cfg = LiveCfg { monitor: 0, height: 480, fps, sound: false, quality: 1 };
         let sh = Arc::new(Shared {
             stop: AtomicBool::new(false),
             video_ssrc: 1,
@@ -1316,6 +1334,7 @@ mod clock {
             nacks: Mutex::new(Vec::new()),
             bitrate: AtomicU32::new(0),
             fps,
+            quality: 1,
             size: AtomicU32::new(0),
             frames: AtomicU32::new(0),
             bytes: AtomicU64::new(0),
@@ -1345,5 +1364,83 @@ mod clock {
         println!("{n} jobs in 2 s; gaps min {:.2} ms max {:.2} ms", gaps.iter().cloned().fold(f64::MAX, f64::min), gaps.iter().cloned().fold(0.0, f64::max));
         assert!((55..=61).contains(&n), "{n} jobs");
         assert!(gaps.iter().all(|g| (g - 1000.0 / fps as f64).abs() < 0.5), "uneven: {gaps:?}");
+    }
+}
+
+#[cfg(test)]
+mod quality_bench {
+    use super::*;
+
+    /// Picture quality (PSNR, higher = closer to the original) and speed for
+    /// encoder effort levels and bitrates, on a moving detailed picture.
+    #[test]
+    #[ignore]
+    fn effort_vs_quality() {
+        use openh264::encoder::{Complexity, Encoder, UsageType};
+        use openh264::formats::{YUVSlices, YUVSource};
+        use openh264::{OpenH264API, Timestamp};
+        let (w, h, fps) = (1920usize, 1080usize, 60u32);
+        let mut frames = Vec::new();
+        for t in 0..40usize {
+            let mut bgra = vec![0u8; w * h * 4];
+            for y in 0..h {
+                for x in 0..w {
+                    let o = (y * w + x) * 4;
+                    // scrolling "text" rows over a moving gradient
+                    let sx = x + t * 9;
+                    let text = (y % 18 < 12) && ((sx / 3) * 7919 + (y / 18) * 104729) % 11 < 4;
+                    let base = [((sx + y) / 6) as u8, (y / 4) as u8, ((sx * 2) / 9) as u8];
+                    let px = if text { [20, 20, 20] } else { base };
+                    bgra[o..o + 4].copy_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+            }
+            let mut pic = I420 { w: 0, h: 0, data: Vec::new() };
+            convert::bgra_to_i420(&bgra, w, h, w * 4, &mut pic);
+            frames.push(pic);
+        }
+        for (name, cx, usage, mult) in [
+            ("low     6.9M", Complexity::Low, UsageType::CameraVideoRealTime, 1.0),
+            ("medium  6.9M", Complexity::Medium, UsageType::CameraVideoRealTime, 1.0),
+            ("high    6.9M", Complexity::High, UsageType::CameraVideoRealTime, 1.0),
+            ("medium  11M ", Complexity::Medium, UsageType::CameraVideoRealTime, 1.6),
+            ("medium  15M ", Complexity::Medium, UsageType::CameraVideoRealTime, 2.2),
+            ("screen  6.9M", Complexity::Medium, UsageType::ScreenContentRealTime, 1.0),
+        ] {
+            let br = (bitrate(w as u32, h as u32, fps) as f64 * mult) as u32;
+            let cfg = encoder_config(fps, br).slice_count(4).num_threads(4).complexity(cx).usage_type(usage);
+            let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg).unwrap();
+            let mut dec = openh264::decoder::Decoder::new().unwrap();
+            let (mut psnr_sum, mut n, mut bytes) = (0.0, 0, 0);
+            let t = Instant::now();
+            for (i, pic) in frames.iter().enumerate() {
+                let (y, rest) = pic.data.split_at(w * h);
+                let (u, v) = rest.split_at((w / 2) * (h / 2));
+                let src = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
+                let au = enc.encode_at(&src, Timestamp::from_millis(i as u64 * 16)).unwrap().to_vec();
+                bytes += au.len();
+                if let Ok(Some(img)) = dec.decode(&au) {
+                    if i >= 10 {
+                        let (sy, ..) = img.strides();
+                        let dy = img.y();
+                        let mut se = 0f64;
+                        for row in 0..h {
+                            for col in 0..w {
+                                let d = dy[row * sy + col] as f64 - y[row * w + col] as f64;
+                                se += d * d;
+                            }
+                        }
+                        let mse = se / (w * h) as f64;
+                        psnr_sum += 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
+                        n += 1;
+                    }
+                }
+            }
+            let per = t.elapsed() / frames.len() as u32;
+            println!(
+                "{name}: {per:?}/frame (encode+decode), PSNR {:.2} dB, actual {:.1} Mbit/s",
+                psnr_sum / n.max(1) as f64,
+                bytes as f64 * 8.0 * fps as f64 / frames.len() as f64 / 1e6
+            );
+        }
     }
 }

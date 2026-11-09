@@ -52,11 +52,13 @@ pub struct LiveCfg {
     pub fps: u32,
     /// Also send what your PC is playing.
     pub sound: bool,
+    /// Picture quality (bitrate): 0 Standard, 1 High, 2 Ultra.
+    pub quality: u8,
 }
 
 impl Default for LiveCfg {
     fn default() -> Self {
-        Self { monitor: usize::MAX, height: 720, fps: 30, sound: true }
+        Self { monitor: usize::MAX, height: 720, fps: 30, sound: true, quality: 1 }
     }
 }
 

@@ -56,8 +56,8 @@ It leaves voice, disconnects, and deletes the saved token.
 ## Sharing your screen (Go Live)
 
 1. Join a voice channel and press **Go Live** (next to Deafen).
-2. Pick the **Screen**, **Resolution** and **FPS**, and whether to
-   **Share PC sound**.
+2. Pick the **Screen**, **Resolution**, **FPS** and **Quality**, and whether
+   to **Share PC sound**.
 3. Press **Go Live**. People in the channel see the red LIVE tag next to you
    and can watch from Discord.
 4. **Stop Live** (main window) or **Stop** (Go Live window) ends it.
@@ -67,8 +67,11 @@ It leaves voice, disconnects, and deletes the saved token.
   allows 1080p 60; Nitro Basic allows 1080p 60; Nitro allows any size at 60.
   You get whichever is higher of your account and the server. Discord has
   no setting above 60 fps.
-- You can change resolution, FPS or sound while live; viewers see a short
-  refresh.
+- **Quality** sets the bitrate: Standard, High (1.6x, the default) or Ultra
+  (2.2x). Higher looks much sharper at 1080p but needs more upload; the
+  window shows about how much (for example, 1080p 60 High is about 11 Mbit/s).
+- You can change resolution, FPS, quality or sound while live; viewers see a
+  short refresh.
 - **PC sound** is everything your PC plays except tinycord itself, so
   viewers don't hear the voice chat twice. Needs Windows 10 (2004) or newer.
 - The status line shows viewers, picture size, frames per second and bitrate.

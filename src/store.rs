@@ -73,6 +73,7 @@ pub fn load_settings() {
             "live_res" => s.live_cfg.height = v.trim().parse().unwrap_or(720),
             "live_fps" => s.live_cfg.fps = v.trim().parse().unwrap_or(30),
             "live_sound" => s.live_cfg.sound = v.trim() != "0",
+            "live_quality" => s.live_cfg.quality = v.trim().parse().unwrap_or(1).min(2),
             "input_volume" => {
                 if let Ok(x) = v.trim().parse::<f32>() {
                     crate::voice::shared()
@@ -108,7 +109,7 @@ pub fn save_settings() {
         crate::voice::shared().vad_db.load(std::sync::atomic::Ordering::Relaxed),
     );
     let text = format!(
-        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\nns_strength={}\nclarity={}\nstream_volume={}\nstream_pin={}\nlive_monitor={}\nlive_res={}\nlive_fps={}\nlive_sound={}\non_top={}\n",
+        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\nns_strength={}\nclarity={}\nstream_volume={}\nstream_pin={}\nlive_monitor={}\nlive_res={}\nlive_fps={}\nlive_sound={}\nlive_quality={}\non_top={}\n",
         match s.mode {
             MicMode::Open => "open",
             MicMode::Voice => "voice",
@@ -132,6 +133,7 @@ pub fn save_settings() {
         s.live_cfg.height,
         s.live_cfg.fps,
         s.live_cfg.sound as u8,
+        s.live_cfg.quality,
         s.keep_on_top as u8,
     );
     drop(s);
@@ -210,7 +212,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("tinycord-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("APPDATA", &tmp);
-        let cfg = LiveCfg { monitor: 1, height: 1080, fps: 60, sound: false };
+        let cfg = LiveCfg { monitor: 1, height: 1080, fps: 60, sound: false, quality: 2 };
         for overlay in 0..=crate::state::OVERLAY_MAX {
             {
                 let mut s = state();
