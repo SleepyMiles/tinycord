@@ -77,6 +77,16 @@ impl VideoPacketizer {
         Self { ssrc, seq: rand_u16() }
     }
 
+    /// Carry on numbering from an earlier packetizer (same stream).
+    pub fn with_seq(ssrc: u32, seq: u16) -> Self {
+        Self { ssrc, seq }
+    }
+
+    /// Sequence number the next packet will get.
+    pub fn next_seq(&self) -> u16 {
+        self.seq
+    }
+
     /// `frame` is the (DAVE-encrypted) Annex B frame, `ts` its 90 kHz time.
     pub fn packetize(&mut self, frame: &[u8], ts: u32) -> Vec<Packet> {
         let nalus = split_nalus(frame);
@@ -392,5 +402,23 @@ mod tests {
         let au = [0, 0, 0, 1, 0x67, 1, 2, 0, 0, 1, 0x68, 3, 0, 0, 0, 1, 0x65, 9, 9];
         let n = split_nalus(&au);
         assert_eq!(n, vec![&[0x67, 1, 2][..], &[0x68, 3][..], &[0x65, 9, 9][..]]);
+    }
+}
+
+#[cfg(test)]
+mod continuity {
+    use super::*;
+
+    /// A new packetizer for the same stream carries on the numbering, so a
+    /// settings change mid-stream doesn't look like a jump to viewers.
+    #[test]
+    fn numbering_carries_on() {
+        let mut a = VideoPacketizer::new(7);
+        let first = a.packetize(&[0, 0, 0, 1, 0x65, 1, 2, 3], 0);
+        let last_seq = u16::from_be_bytes([first.last().unwrap().header[2], first.last().unwrap().header[3]]);
+        let mut b = VideoPacketizer::with_seq(7, a.next_seq());
+        let next = b.packetize(&[0, 0, 0, 1, 0x41, 9], 3000);
+        let seq = u16::from_be_bytes([next[0].header[2], next[0].header[3]]);
+        assert_eq!(seq, last_seq.wrapping_add(1));
     }
 }

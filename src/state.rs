@@ -52,7 +52,7 @@ pub struct LiveCfg {
     pub fps: u32,
     /// Also send what your PC is playing.
     pub sound: bool,
-    /// Picture quality (bitrate): 0 Standard, 1 High, 2 Ultra.
+    /// Picture quality (bitrate): 0 Standard, 1 High, 2 Ultra, 3 Max.
     pub quality: u8,
 }
 

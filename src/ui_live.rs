@@ -129,7 +129,7 @@ unsafe fn build(hwnd: HWND) {
     let note = child(hwnd, "STATIC", "", SS_LEFT as u32, 8, 122, 264, 48, ID_NOTE, dpi, font);
     let go = child(hwnd, "BUTTON", "Go Live", ts | BS_DEFPUSHBUTTON as u32, 8, 174, 264, 30, ID_GO, dpi, font);
     let status = child(hwnd, "STATIC", "", SS_LEFT as u32, 8, 210, 264, 32, ID_STATUS, dpi, font);
-    combo_add(quality, &["Standard", "High (sharper)", "Ultra (needs fast upload)"]);
+    combo_add(quality, &["Standard", "High (sharper)", "Ultra (needs fast upload)", "Max (needs very fast upload)"]);
 
     let monitors = crate::capture::monitors();
     let names: Vec<String> = if monitors.is_empty() {
@@ -161,7 +161,7 @@ unsafe fn build(hwnd: HWND) {
     let m = with(|l| crate::capture::resolve(cfg.monitor, &l.monitors)).unwrap_or(0).min(names.len() - 1);
     SendMessageW(mon, CB_SETCURSEL, m, 0);
     SendMessageW(sound, BM_SETCHECK, cfg.sound as usize, 0);
-    SendMessageW(quality, CB_SETCURSEL, cfg.quality.min(2) as usize, 0);
+    SendMessageW(quality, CB_SETCURSEL, cfg.quality.min(3) as usize, 0);
     fill_options();
     update();
 }
@@ -246,7 +246,7 @@ unsafe fn read_cfg() -> Option<LiveCfg> {
             height: l.res_items.get(ri).copied().unwrap_or(720),
             fps: l.fps_items.get(fi).copied().unwrap_or(30),
             sound: SendMessageW(l.sound, BM_GETCHECK, 0, 0) == 1,
-            quality: SendMessageW(l.quality, CB_GETCURSEL, 0, 0).clamp(0, 2) as u8,
+            quality: SendMessageW(l.quality, CB_GETCURSEL, 0, 0).clamp(0, 3) as u8,
         }
     })
 }

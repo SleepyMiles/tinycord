@@ -71,7 +71,7 @@ pub fn clamp(mut cfg: LiveCfg, (max_h, max_fps): (u32, u32)) -> LiveCfg {
 }
 
 /// Quality choices: name and how much more bitrate than Standard.
-pub const QUALITY: [(&str, f64); 3] = [("Standard", 1.0), ("High", 1.6), ("Ultra", 2.2)];
+pub const QUALITY: [(&str, f64); 4] = [("Standard", 1.0), ("High", 1.6), ("Ultra", 2.2), ("Max", 3.0)];
 
 /// Bitrate for a picture size, frame rate and quality choice. Bitrate is
 /// what makes 1080p look sharp: in tests, High (1.6x) gave about 5 dB
@@ -107,6 +107,23 @@ struct Session {
     driver: Option<Driver>,
     connected_with: Option<(String, String)>,
     pipeline: Option<Pipeline>,
+    cont: Option<Arc<Continuity>>,
+}
+
+/// Packet numbering and the stream clock. These must carry on when
+/// settings change mid-stream: starting them over makes viewers' players
+/// treat every new frame as old and drop it (the stream freezes).
+struct Continuity {
+    t0: Instant,
+    video_seq: Mutex<Option<u16>>,
+    /// Next audio sequence number and timestamp, and when the last went out.
+    audio: Mutex<Option<(u16, u32, Instant)>>,
+}
+
+impl Continuity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { t0: Instant::now(), video_seq: Mutex::new(None), audio: Mutex::new(None) })
+    }
 }
 
 static SESSION: tokio::sync::Mutex<Option<Session>> = tokio::sync::Mutex::const_new(None);
@@ -149,6 +166,7 @@ pub async fn begin(key: String, guild: u64, channel: u64, cfg: LiveCfg) {
         driver: None,
         connected_with: None,
         pipeline: None,
+        cont: None,
     });
 }
 
@@ -159,8 +177,9 @@ pub async fn reconfigure(cfg: LiveCfg) {
     s.cfg = cfg;
     if let Some(p) = s.pipeline.take() {
         let sender = p.sender.clone();
-        let _ = tokio::task::spawn_blocking(move || p.finish()).await;
-        s.pipeline = Some(Pipeline::start(sender, cfg));
+        let _ = tokio::task::spawn_blocking(move || p.finish(false)).await;
+        let cont = s.cont.get_or_insert_with(Continuity::new).clone();
+        s.pipeline = Some(Pipeline::start(sender, cfg, cont));
     }
 }
 
@@ -170,7 +189,7 @@ pub async fn stop() -> Option<String> {
     let old = SESSION.lock().await.take();
     let key = if let Some(mut s) = old {
         if let Some(p) = s.pipeline.take() {
-            let _ = tokio::task::spawn_blocking(move || p.finish()).await;
+            let _ = tokio::task::spawn_blocking(move || p.finish(true)).await;
         }
         if let Some(mut d) = s.driver.take() {
             d.leave();
@@ -255,7 +274,7 @@ async fn try_connect(s: &mut Session, session_id: Option<String>) {
     };
     // A new server: stop sending to the old one first.
     if let Some(p) = s.pipeline.take() {
-        let _ = tokio::task::spawn_blocking(move || p.finish()).await;
+        let _ = tokio::task::spawn_blocking(move || p.finish(true)).await;
     }
     if let Ok(mut g) = video_hook::SENDER.write() {
         *g = None;
@@ -287,7 +306,10 @@ async fn try_connect(s: &mut Session, session_id: Option<String>) {
         sender.video_ssrc,
         sender.rtx_ssrc
     );
-    s.pipeline = Some(Pipeline::start(sender, s.cfg));
+    // New connection: numbering starts fresh.
+    let cont = Continuity::new();
+    s.cont = Some(cont.clone());
+    s.pipeline = Some(Pipeline::start(sender, s.cfg, cont));
 }
 
 /// Messages on the stream's voice connection (just logged).
@@ -437,7 +459,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    fn start(sender: Arc<MediaSender>, cfg: LiveCfg) -> Pipeline {
+    fn start(sender: Arc<MediaSender>, cfg: LiveCfg, cont: Arc<Continuity>) -> Pipeline {
         // The server normally hands out the video SSRCs; fall back to the
         // usual layout (audio + 1, + 2) if it didn't.
         let video_ssrc = if sender.video_ssrc != 0 { sender.video_ssrc } else { sender.audio_ssrc.wrapping_add(1) };
@@ -491,7 +513,6 @@ impl Pipeline {
         let slot = Arc::new(Slot::<Job>::new());
         let (free_tx, free_rx) = mpsc::channel::<I420>();
         let (enc_tx, enc_rx) = mpsc::channel::<Encoded>();
-        let t0 = Instant::now();
         let mut threads = Vec::new();
         {
             let (sh, slot) = (sh.clone(), slot.clone());
@@ -499,7 +520,8 @@ impl Pipeline {
         }
         {
             let (sh, sender) = (sh.clone(), sender.clone());
-            threads.push(spawn("tinycord-encode", move || encode_thread(cfg, sh, sender, slot, free_tx, enc_tx, t0)));
+            let cont = cont.clone();
+            threads.push(spawn("tinycord-encode", move || encode_thread(cfg, sh, sender, slot, free_tx, enc_tx, cont)));
         }
         {
             let (sh, sender) = (sh.clone(), sender.clone());
@@ -507,14 +529,16 @@ impl Pipeline {
         }
         if cfg.sound {
             let (sh, sender) = (sh.clone(), sender.clone());
-            threads.push(spawn("tinycord-pcsound", move || audio_thread(sh, sender)));
+            let cont = cont.clone();
+            threads.push(spawn("tinycord-pcsound", move || audio_thread(sh, sender, cont)));
         }
         set_status("Live");
         Pipeline { sh, sender, threads }
     }
 
-    /// Stop all threads and wait for them (well under a second).
-    fn finish(self) {
+    /// Stop all threads and wait for them (well under a second). `end` =
+    /// the stream is ending (not just restarting with new settings).
+    fn finish(self, end: bool) {
         self.sh.stop.store(true, Ordering::Relaxed);
         for t in self.threads {
             let _ = t.join();
@@ -524,11 +548,13 @@ impl Pipeline {
             *fb = None;
         }
         drop(fb);
-        // Tell viewers the picture stopped.
-        let off = json!({"op": 12, "d": {"audio_ssrc": self.sender.audio_ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": []}});
-        self.sender.send_ws(off.to_string());
-        self.sender
-            .send_ws(json!({"op": 5, "d": {"speaking": 0, "delay": 0, "ssrc": self.sender.audio_ssrc}}).to_string());
+        if end {
+            // Tell viewers the picture stopped.
+            let off = json!({"op": 12, "d": {"audio_ssrc": self.sender.audio_ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": []}});
+            self.sender.send_ws(off.to_string());
+            self.sender
+                .send_ws(json!({"op": 5, "d": {"speaking": 0, "delay": 0, "ssrc": self.sender.audio_ssrc}}).to_string());
+        }
         #[cfg(windows)]
         unsafe {
             windows_sys::Win32::Media::timeEndPeriod(1);
@@ -626,7 +652,9 @@ fn capture_thread(cfg: LiveCfg, sh: Arc<Shared>, slot: Arc<Slot<Job>>, free: mps
             }
             None => false,
         };
-        let Some(c) = cap.as_ref().filter(|_| changed) else {
+        // A new picture, or an earlier copy that may be back from the GPU now.
+        let want = changed || cap.as_ref().is_some_and(|c| c.has_pending());
+        let Some(c) = cap.as_mut().filter(|_| want) else {
             post(&slot, Job::Repeat(tick));
             continue;
         };
@@ -697,8 +725,9 @@ fn encode_thread(
     slot: Arc<Slot<Job>>,
     free: mpsc::Sender<I420>,
     out: mpsc::Sender<Encoded>,
-    t0: Instant,
+    cont: Arc<Continuity>,
 ) {
+    let t0 = cont.t0;
     use openh264::encoder::{Encoder, FrameType};
     use openh264::formats::YUVSlices;
     use openh264::{OpenH264API, Timestamp};
@@ -707,7 +736,10 @@ fn encode_thread(
     let mut last: Option<Frame> = None;
     let mut last_idr = Instant::now() - Duration::from_secs(60);
     let mut need_idr = true;
-    let mut pk = VideoPacketizer::new(sh.video_ssrc);
+    let mut pk = match cont.video_seq.lock().unwrap().take() {
+        Some(seq) => VideoPacketizer::with_seq(sh.video_ssrc, seq),
+        None => VideoPacketizer::new(sh.video_ssrc),
+    };
     let mut last_at = t0;
     // The capture clock sends a job every tick; this only matters if it
     // stalls (then keep the stream alive with repeats).
@@ -816,6 +848,8 @@ fn encode_thread(
             break;
         }
     }
+    // Settings changed or stream ending: the next encoder carries on from here.
+    *cont.video_seq.lock().unwrap() = Some(pk.next_seq());
 }
 
 // ---------------------------------------------------------------- send
@@ -1023,7 +1057,7 @@ fn adapt(sh: &Shared, loss_avg: &mut f64, last_change: &mut Instant, clean_since
 
 // ---------------------------------------------------------------- PC sound
 
-fn audio_thread(sh: Arc<Shared>, sender: Arc<MediaSender>) {
+fn audio_thread(sh: Arc<Shared>, sender: Arc<MediaSender>, cont: Arc<Continuity>) {
     use songbird::driver::opus::{Application, Bitrate, Channels, Encoder};
     let mut enc = match Encoder::new(48000, Channels::Stereo, Application::Audio) {
         Ok(e) => e,
@@ -1034,12 +1068,13 @@ fn audio_thread(sh: Arc<Shared>, sender: Arc<MediaSender>) {
     };
     let _ = enc.set_bitrate(Bitrate::Bits(128_000));
     let ssrc = sender.audio_ssrc;
-    let mut seq: u16 = rand_u16();
-    let mut ts: u32 = (rand_u16() as u32) << 16;
+    let resume = cont.audio.lock().unwrap().take();
+    let mut seq: u16 = resume.map(|r| r.0).unwrap_or_else(rand_u16);
+    let mut ts: u32 = resume.map(|r| r.1).unwrap_or_else(|| (rand_u16() as u32) << 16);
     let mut out = vec![0u8; 4000];
     let (mut packets, mut octets) = (0u32, 0u32);
     let mut last_sr = Instant::now();
-    let mut last_sent: Option<Instant> = None;
+    let mut last_sent: Option<Instant> = resume.map(|r| r.2);
     let stop = Arc::new(AtomicBool::new(false));
     // sysaudio watches its own flag; mirror ours into it.
     let watcher = {
@@ -1051,8 +1086,9 @@ fn audio_thread(sh: Arc<Shared>, sender: Arc<MediaSender>) {
             stop.store(true, Ordering::Relaxed);
         })
     };
-    let res = crate::sysaudio::run(stop, |chunk, gap| {
+    let res = crate::sysaudio::run(stop, |chunk, _| {
         let mut marker = false;
+        let gap = last_sent.map(|t| t.elapsed()).unwrap_or_default();
         if last_sent.is_some() && gap > Duration::from_millis(60) {
             // Silence in between: move the clock on so timing stays right.
             let extra = (gap - Duration::from_millis(20)).as_micros() as u64 * 48 / 1000;
@@ -1074,6 +1110,9 @@ fn audio_thread(sh: Arc<Shared>, sender: Arc<MediaSender>) {
         seq = seq.wrapping_add(1);
         ts = ts.wrapping_add(960);
     });
+    if let Some(t) = last_sent {
+        *cont.audio.lock().unwrap() = Some((seq, ts, t));
+    }
     if let Err(msg) = res {
         tracing::warn!("{msg}");
         live_mut(|l| l.sound_note = msg);
@@ -1103,7 +1142,7 @@ mod tests {
         let c = clamp(LiveCfg { monitor: 0, height: 1440, fps: 60, sound: true, quality: 1 }, allowed(0, 0));
         assert_eq!((c.height, c.fps), (720, 30));
         let c = clamp(LiveCfg { monitor: 0, height: 0, fps: 60, sound: true, quality: 9 }, allowed(0, 2));
-        assert_eq!(c.quality, 2);
+        assert_eq!(c.quality, 3);
         assert!(target_bitrate(1920, 1080, 60, 1) > bitrate(1920, 1080, 60));
         assert_eq!((c.height, c.fps), (1080, 60));
         assert!(bitrate(1280, 720, 30) > 2_000_000 && bitrate(1920, 1080, 60) > bitrate(1920, 1080, 30));
@@ -1247,7 +1286,7 @@ mod still_screen {
         use openh264::formats::YUVSlices;
         use openh264::{OpenH264API, Timestamp};
         let (w, h, fps) = (1280usize, 720usize, 30u32);
-        let cap = Capturer::new(0).unwrap();
+        let mut cap = Capturer::new(0).unwrap();
         let mut pic = I420 { w: 0, h: 0, data: Vec::new() };
         cap.with_frame(|src, sw, sh, pitch, _| convert::bgra_to_i420(src, sw, sh, pitch, &mut pic));
         assert_eq!((pic.w, pic.h), (w, h));

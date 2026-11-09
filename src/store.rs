@@ -73,7 +73,7 @@ pub fn load_settings() {
             "live_res" => s.live_cfg.height = v.trim().parse().unwrap_or(720),
             "live_fps" => s.live_cfg.fps = v.trim().parse().unwrap_or(30),
             "live_sound" => s.live_cfg.sound = v.trim() != "0",
-            "live_quality" => s.live_cfg.quality = v.trim().parse().unwrap_or(1).min(2),
+            "live_quality" => s.live_cfg.quality = v.trim().parse().unwrap_or(1).min(3),
             "input_volume" => {
                 if let Ok(x) = v.trim().parse::<f32>() {
                     crate::voice::shared()

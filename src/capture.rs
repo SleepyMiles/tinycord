@@ -88,7 +88,15 @@ mod imp {
         ctx: ID3D11DeviceContext,
         device: ID3D11Device,
         dup: IDXGIOutputDuplication,
-        staging: Option<(ID3D11Texture2D, usize, usize)>,
+        /// CPU-readable copies of the screen. Copies come back from the GPU
+        /// a little later; we never wait for one (a game keeping the GPU
+        /// busy would stall the stream's clock), we use the newest that's done.
+        staging: Vec<ID3D11Texture2D>,
+        size: (usize, usize),
+        /// Copies on their way back, oldest first (indices into `staging`).
+        pending: std::collections::VecDeque<usize>,
+        /// The copy used last (complete; reused when only the pointer moves).
+        shown: Option<usize>,
         pointer: Pointer,
         ptr_pos: (i32, i32),
         ptr_visible: bool,
@@ -139,7 +147,10 @@ mod imp {
                     ctx,
                     device,
                     dup,
-                    staging: None,
+                    staging: Vec::new(),
+                    size: (0, 0),
+                    pending: std::collections::VecDeque::new(),
+                    shown: None,
                     pointer: Pointer::default(),
                     ptr_pos: (0, 0),
                     ptr_visible: false,
@@ -162,7 +173,11 @@ mod imp {
                         let mut d = D3D11_TEXTURE2D_DESC::default();
                         tex.GetDesc(&mut d);
                         let (w, h) = (d.Width as usize, d.Height as usize);
-                        if self.staging.as_ref().is_none_or(|s| s.1 != w || s.2 != h) {
+                        if self.staging.len() != 3 || self.size != (w, h) {
+                            self.staging.clear();
+                            self.pending.clear();
+                            self.shown = None;
+                            self.size = (w, h);
                             let sd = D3D11_TEXTURE2D_DESC {
                                 Width: d.Width,
                                 Height: d.Height,
@@ -175,13 +190,26 @@ mod imp {
                                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
                                 MiscFlags: 0,
                             };
-                            let mut t = None;
-                            if self.device.CreateTexture2D(&sd, None, Some(&mut t)).is_ok() {
-                                self.staging = t.map(|t| (t, w, h));
+                            for _ in 0..3 {
+                                let mut t = None;
+                                if self.device.CreateTexture2D(&sd, None, Some(&mut t)).is_ok() {
+                                    if let Some(t) = t {
+                                        self.staging.push(t);
+                                    }
+                                }
+                            }
+                            if self.staging.len() != 3 {
+                                self.staging.clear();
                             }
                         }
-                        if let Some((st, _, _)) = &self.staging {
-                            self.ctx.CopyResource(st, &tex);
+                        if !self.staging.is_empty() {
+                            // A free copy slot, or else the oldest copy still on its way.
+                            let free = (0..3).find(|i| Some(*i) != self.shown && !self.pending.contains(i));
+                            let idx = free.or_else(|| self.pending.pop_front()).unwrap_or(0);
+                            self.ctx.CopyResource(&self.staging[idx], &tex);
+                            self.ctx.Flush(); // start the copy now
+                            self.pending.retain(|i| *i != idx);
+                            self.pending.push_back(idx);
                             changed = true;
                         }
                     }
@@ -220,17 +248,49 @@ mod imp {
             }
         }
 
-        /// Run `f` on the latest picture: (BGRA pixels, width, height, bytes
-        /// per row, the pointer and where it is).
-        pub fn with_frame<R>(&self, f: impl FnOnce(&[u8], usize, usize, usize, Option<(&Pointer, i32, i32)>) -> R) -> Option<R> {
-            let (st, w, h) = self.staging.as_ref()?;
+        /// A copy is still on its way back from the GPU.
+        pub fn has_pending(&self) -> bool {
+            !self.pending.is_empty()
+        }
+
+        /// Run `f` on the newest finished picture: (BGRA pixels, width,
+        /// height, bytes per row, the pointer and where it is). None when the
+        /// newest copy isn't back yet (try again next tick).
+        pub fn with_frame<R>(
+            &mut self,
+            f: impl FnOnce(&[u8], usize, usize, usize, Option<(&Pointer, i32, i32)>) -> R,
+        ) -> Option<R> {
+            let (w, h) = self.size;
             unsafe {
                 let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-                self.ctx.Map(st, 0, D3D11_MAP_READ, 0, Some(&mut m)).ok()?;
+                // Newest finished copy, without waiting for the GPU.
+                let mut found = None;
+                for k in (0..self.pending.len()).rev() {
+                    let idx = self.pending[k];
+                    let flags = D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32;
+                    if self.ctx.Map(&self.staging[idx], 0, D3D11_MAP_READ, flags, Some(&mut m)).is_ok() {
+                        found = Some((k, idx));
+                        break;
+                    }
+                }
+                let idx = match found {
+                    Some((k, idx)) => {
+                        self.pending.drain(..=k); // older copies are outdated
+                        self.shown = Some(idx);
+                        idx
+                    }
+                    // Only the pointer moved: redraw the last picture.
+                    None if self.pending.is_empty() => {
+                        let idx = self.shown?;
+                        self.ctx.Map(&self.staging[idx], 0, D3D11_MAP_READ, 0, Some(&mut m)).ok()?;
+                        idx
+                    }
+                    None => return None,
+                };
                 let pitch = m.RowPitch as usize;
-                let data = std::slice::from_raw_parts(m.pData as *const u8, pitch * *h);
-                let r = f(data, *w, *h, pitch, self.pointer());
-                self.ctx.Unmap(st, 0);
+                let data = std::slice::from_raw_parts(m.pData as *const u8, pitch * h);
+                let r = f(data, w, h, pitch, self.pointer());
+                self.ctx.Unmap(&self.staging[idx], 0);
                 Some(r)
             }
         }
@@ -278,7 +338,11 @@ impl Capturer {
         Ok(true)
     }
 
-    pub fn with_frame<R>(&self, f: impl FnOnce(&[u8], usize, usize, usize, Option<(&Pointer, i32, i32)>) -> R) -> Option<R> {
+    pub fn has_pending(&self) -> bool {
+        false
+    }
+
+    pub fn with_frame<R>(&mut self, f: impl FnOnce(&[u8], usize, usize, usize, Option<(&Pointer, i32, i32)>) -> R) -> Option<R> {
         Some(f(&self.buf, self.w, self.h, self.w * 4, None))
     }
 

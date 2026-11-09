@@ -67,8 +67,8 @@ It leaves voice, disconnects, and deletes the saved token.
   allows 1080p 60; Nitro Basic allows 1080p 60; Nitro allows any size at 60.
   You get whichever is higher of your account and the server. Discord has
   no setting above 60 fps.
-- **Quality** sets the bitrate: Standard, High (1.6x, the default) or Ultra
-  (2.2x). Higher looks much sharper at 1080p but needs more upload; the
+- **Quality** sets the bitrate: Standard, High (1.6x, the default), Ultra
+  (2.2x) or Max (3x). Higher looks much sharper at 1080p but needs more upload; the
   window shows about how much (for example, 1080p 60 High is about 11 Mbit/s).
 - You can change resolution, FPS, quality or sound while live; viewers see a
   short refresh.
