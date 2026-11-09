@@ -254,23 +254,42 @@ mod imp {
         }
 
         /// Run `f` on the newest finished picture: (BGRA pixels, width,
-        /// height, bytes per row, the pointer and where it is). None when the
-        /// newest copy isn't back yet (try again next tick).
+        /// height, bytes per row, the pointer and where it is). Waits up to
+        /// `wait` for the newest copy (usually back in a millisecond or two),
+        /// then takes the newest one that's done. None when nothing is back
+        /// yet (try again next tick).
         pub fn with_frame<R>(
             &mut self,
+            wait: std::time::Duration,
             f: impl FnOnce(&[u8], usize, usize, usize, Option<(&Pointer, i32, i32)>) -> R,
         ) -> Option<R> {
             let (w, h) = self.size;
             unsafe {
                 let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-                // Newest finished copy, without waiting for the GPU.
+                let flags = D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32;
                 let mut found = None;
-                for k in (0..self.pending.len()).rev() {
-                    let idx = self.pending[k];
-                    let flags = D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32;
-                    if self.ctx.Map(&self.staging[idx], 0, D3D11_MAP_READ, flags, Some(&mut m)).is_ok() {
-                        found = Some((k, idx));
-                        break;
+                // The newest copy, giving the GPU a moment to finish it.
+                if let Some(&idx) = self.pending.back() {
+                    let deadline = std::time::Instant::now() + wait;
+                    loop {
+                        if self.ctx.Map(&self.staging[idx], 0, D3D11_MAP_READ, flags, Some(&mut m)).is_ok() {
+                            found = Some((self.pending.len() - 1, idx));
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                // Else the newest older copy that's done, without waiting.
+                if found.is_none() {
+                    for k in (0..self.pending.len().saturating_sub(1)).rev() {
+                        let idx = self.pending[k];
+                        if self.ctx.Map(&self.staging[idx], 0, D3D11_MAP_READ, flags, Some(&mut m)).is_ok() {
+                            found = Some((k, idx));
+                            break;
+                        }
                     }
                 }
                 let idx = match found {
@@ -342,7 +361,11 @@ impl Capturer {
         false
     }
 
-    pub fn with_frame<R>(&mut self, f: impl FnOnce(&[u8], usize, usize, usize, Option<(&Pointer, i32, i32)>) -> R) -> Option<R> {
+    pub fn with_frame<R>(
+        &mut self,
+        _wait: std::time::Duration,
+        f: impl FnOnce(&[u8], usize, usize, usize, Option<(&Pointer, i32, i32)>) -> R,
+    ) -> Option<R> {
         Some(f(&self.buf, self.w, self.h, self.w * 4, None))
     }
 

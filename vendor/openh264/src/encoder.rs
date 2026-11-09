@@ -647,6 +647,8 @@ pub struct EncoderConfig {
     max_slice_len: Option<u32>,
     // tinycord patch: a fixed number of slices per picture.
     slice_count: Option<u32>,
+    // tinycord patch: CABAC entropy coding (needs Main or High profile).
+    cabac: bool,
     profile: Option<Profile>,
     level: Option<Level>,
     complexity: Complexity,
@@ -675,6 +677,7 @@ impl EncoderConfig {
             usage_type: UsageType::CameraVideoRealTime,
             max_slice_len: None,
             slice_count: None,
+            cabac: false,
             profile: None,
             level: None,
             complexity: Complexity::Medium,
@@ -727,6 +730,14 @@ impl EncoderConfig {
     /// Set the SPS/PPS behavior.
     pub const fn sps_pps_strategy(mut self, value: SpsPpsStrategy) -> Self {
         self.sps_pps_strategy = value;
+        self
+    }
+
+    /// tinycord patch: CABAC entropy coding: the same picture in fewer bits
+    /// (needs `profile(Profile::Main)` or High).
+    #[must_use]
+    pub const fn cabac(mut self, on: bool) -> Self {
+        self.cabac = on;
         self
     }
 
@@ -997,6 +1008,9 @@ impl Encoder {
         params.iMinQp = self.config.qp.min.into();
         params.iMaxQp = self.config.qp.max.into();
 
+        if self.config.cabac {
+            params.iEntropyCodingModeFlag = 1;
+        }
         if let Some(profile) = self.config.profile {
             params.sSpatialLayers[0].uiProfileIdc = profile.to_c();
         }
