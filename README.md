@@ -152,7 +152,8 @@ the newest code: `git pull`, then build again.
   hand video packets to tinycord, and send RTCP keyframe requests.
 - Go Live sending (`src/golive.rs`): DXGI Desktop Duplication for the screen
   (`src/capture.rs`), scaling and colour conversion (`src/convert.rs`),
-  OpenH264 encoding with packet-sized slices, RTP packetizing with
+  OpenH264 encoding (`vendor/openh264`, patched for a fixed slice count:
+  DAVE can only describe a few dozen NAL units per frame), RTP packetizing with
   retransmission and sender reports (`src/rtp.rs`), DAVE encryption, and
   WASAPI process loopback for PC sound (`src/sysaudio.rs`) encoded with Opus.
 - GitHub Actions builds the `.exe` on each push to `main`.

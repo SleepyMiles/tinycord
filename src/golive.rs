@@ -345,6 +345,7 @@ struct Stats {
     send_retry: AtomicU32,
     send_err: AtomicU32,
     queue_max: AtomicU32,
+    e2ee_failed: AtomicU32,
     loss_reports: AtomicU32,
     /// Worst share of packets lost in one report (0-255).
     loss_max: AtomicU32,
@@ -634,9 +635,10 @@ fn encoder_config(fps: u32, bitrate: u32) -> openh264::encoder::EncoderConfig {
         .skip_frames(true)
         .complexity(Complexity::Low)
         .num_threads(threads as u16)
-        // Slices that fit in one packet: a lost packet only spoils a strip
-        // of the picture, and the encoder can use several cores.
-        .max_slice_len(rtp::MTU as u32 - 100)
+        // A few slices let the encoder use several cores. Not more: the
+        // end-to-end encryption can only describe a few dozen pieces per
+        // frame, and frames with too many can't be sent at all.
+        .slice_count(threads as u32)
         .intra_frame_period(IntraFramePeriod::auto())
         .vui(VuiConfig::bt709())
 }
@@ -753,7 +755,12 @@ fn encode_thread(
         // End-to-end encryption (DAVE). Until it's ready nothing can go out;
         // the first picture after that must be a keyframe.
         let Some(frame) = sender.e2ee(davey::MediaType::VIDEO, davey::Codec::H264, &au) else {
-            sh.st.e2ee_wait.fetch_add(1, Ordering::Relaxed);
+            if sender.e2ee_ready() {
+                // Ready but this frame couldn't be encrypted.
+                sh.st.e2ee_failed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                sh.st.e2ee_wait.fetch_add(1, Ordering::Relaxed);
+            }
             need_idr = true;
             continue;
         };
@@ -899,7 +906,7 @@ fn log_stats(sh: &Shared, secs: f64) {
     tracing::info!(
         "live {}x{}: capture {:.0} fps (max {:.1} ms), encode {:.0} fps (avg {:.1} ms, max {:.1} ms), \
          rc skipped {}, keyframes {} (viewers asked {}), lost {} resent {} too old {}, \
-         send retries {} errors {}, queue max {}, waiting for e2ee {}, target {} kbit/s, \
+         send retries {} errors {}, queue max {}, waiting for e2ee {} failed {}, target {} kbit/s, \
          loss reports {} (worst {}%), server estimate {} kbit/s",
         size >> 16,
         size & 0xffff,
@@ -918,6 +925,7 @@ fn log_stats(sh: &Shared, secs: f64) {
         take(&st.send_err),
         take(&st.queue_max),
         take(&st.e2ee_wait),
+        take(&st.e2ee_failed),
         sh.bitrate.load(Ordering::Relaxed) / 1000,
         take(&st.loss_reports),
         take(&st.loss_max) * 100 / 256,
@@ -1141,7 +1149,7 @@ mod bench {
             frames.push(pic);
         }
         for sliced in [false, true] {
-            let mut cfg = encoder_config(fps, bitrate(w as u32, h as u32, fps));
+            let mut cfg = encoder_config(fps, bitrate(w as u32, h as u32, fps)).slice_count(4).num_threads(4);
             if !sliced {
                 cfg = openh264::encoder::EncoderConfig::new()
                     .usage_type(openh264::encoder::UsageType::CameraVideoRealTime)
@@ -1209,5 +1217,52 @@ mod still_screen {
         println!("{out:?}");
         // Every repeat must produce a frame (an empty one would send nothing).
         assert!(out.iter().all(|(n, kind)| *n > 0 && kind != "Skip"), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod e2ee_budget {
+    use super::*;
+
+    /// The end-to-end encryption describes each NAL unit of a frame in a
+    /// trailer that must stay under 255 bytes (about 4 bytes per NAL), or the
+    /// frame can't be sent. Keep NAL counts tiny even for big keyframes.
+    #[test]
+    fn few_nal_units_per_frame() {
+        use openh264::encoder::Encoder;
+        use openh264::formats::YUVSlices;
+        use openh264::{OpenH264API, Timestamp};
+        // 4 slices = what a PC with 8+ threads uses.
+        for &(w, h) in &[(1920usize, 1080usize), (2560, 1440)] {
+            let cfg = encoder_config(60, bitrate(w as u32, h as u32, 60)).slice_count(4).num_threads(4);
+            let mut enc = Encoder::with_api_config(OpenH264API::from_source(), cfg).unwrap();
+            let mut worst = 0;
+            let mut biggest = 0;
+            for t in 0..12usize {
+                // Busy picture: fine text-like detail that changes every frame.
+                let mut bgra = vec![0u8; w * h * 4];
+                for y in 0..h {
+                    for x in 0..w {
+                        let o = (y * w + x) * 4;
+                        let v = ((x * 7 + y * 13 + t * 31) ^ (x * y / 3)) as u8;
+                        bgra[o..o + 4].copy_from_slice(&[v, v.rotate_left(3), v ^ 0x5a, 255]);
+                    }
+                }
+                let mut pic = I420 { w: 0, h: 0, data: Vec::new() };
+                convert::bgra_to_i420(&bgra, w, h, w * 4, &mut pic);
+                if t == 6 {
+                    enc.force_intra_frame();
+                }
+                let (y, rest) = pic.data.split_at(w * h);
+                let (u, v) = rest.split_at((w / 2) * (h / 2));
+                let src = YUVSlices::new((y, u, v), (w, h), (w, w / 2, w / 2));
+                let au = enc.encode_at(&src, Timestamp::from_millis(t as u64 * 16)).unwrap().to_vec();
+                let nals = rtp::split_nalus(&au).len();
+                worst = worst.max(nals);
+                biggest = biggest.max(au.len());
+            }
+            println!("{w}x{h}: at most {worst} NAL units per frame (largest frame {} KB)", biggest / 1024);
+            assert!(worst <= 8, "{w}x{h}: {worst} NAL units in one frame");
+        }
     }
 }

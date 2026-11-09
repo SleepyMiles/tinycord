@@ -334,7 +334,9 @@ async fn go_live(cfg: state::LiveCfg, out: &mut Vec<Value>) {
         return;
     }
     // Only what your account or this server allows.
-    let cfg = golive::clamp(cfg, golive::allowed(premium, boost));
+    let allowed = golive::allowed(premium, boost);
+    let cfg = golive::clamp(cfg, allowed);
+    tracing::info!("go live: nitro type {premium}, server boost {boost}, allowed {allowed:?}, using {cfg:?}");
     if golive::live_in(g, c).await {
         golive::reconfigure(cfg).await;
         return;
@@ -535,6 +537,12 @@ async fn dispatch(
                 let mut s = state();
                 s.me = me;
                 s.premium = d["user"]["premium_type"].as_u64().unwrap_or(0).min(3) as u8;
+                tracing::info!(
+                    "account: nitro type {} (raw premium_type {}, premium {})",
+                    s.premium,
+                    d["user"]["premium_type"],
+                    d["user"]["premium"]
+                );
                 s.names.insert(me, me_name.clone());
                 s.guilds.clear();
                 s.voice.clear();

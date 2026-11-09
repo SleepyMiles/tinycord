@@ -1,6 +1,6 @@
 [package]
 name = "tinycord"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 
 [lints.rust]
@@ -45,3 +45,4 @@ strip = true
 
 [patch.crates-io]
 songbird = { path = "vendor/songbird" }
+openh264 = { path = "vendor/openh264" }
