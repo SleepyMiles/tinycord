@@ -89,7 +89,6 @@ pub fn open(guild: u64, channel: u64) {
         }
         let list: Vec<Value> = serde_json::from_str(&body).unwrap_or_default();
         let mut msgs: Vec<Msg> = list.iter().rev().map(render).collect();
-        let newest = msgs.last().map(|m| m.id);
         {
             let mut s = state();
             if let Some(c) = s.chat.as_mut().filter(|c| c.channel == channel) {
@@ -102,9 +101,6 @@ pub fn open(guild: u64, channel: u64) {
             }
         }
         state::changed();
-        if let Some(m) = newest {
-            ack(channel, m).await;
-        }
     });
 }
 
@@ -154,23 +150,10 @@ pub fn send(channel: u64, text: String) {
     });
 }
 
-/// Mark messages as read on Discord (so your phone doesn't show them unread).
-async fn ack(channel: u64, message: u64) {
-    let Some((http, token)) = client() else { return };
-    let _ = http
-        .post(format!("{API}/channels/{channel}/messages/{message}/ack"))
-        .header("Authorization", &token)
-        .header("Content-Type", "application/json")
-        .body(r#"{"token":null}"#)
-        .send()
-        .await;
-}
-
 /// MESSAGE_CREATE / UPDATE / DELETE from the main connection.
 pub fn on_event(t: &str, d: &Value) {
     let channel = id(&d["channel_id"]);
     let mut changed = false;
-    let mut ack_it = None;
     // Render before taking the state lock (rendering looks up names in it).
     let rendered = (t == "MESSAGE_CREATE" || d.get("content").is_some()).then(|| render(d));
     {
@@ -205,7 +188,6 @@ pub fn on_event(t: &str, d: &Value) {
                             let cut = c.msgs.len() - KEEP;
                             c.msgs.drain(..cut);
                         }
-                        ack_it = Some(mid);
                     }
                 }
                 // Updates can be partial (an embed loading): only redo
@@ -229,9 +211,6 @@ pub fn on_event(t: &str, d: &Value) {
     }
     if changed {
         state::changed();
-    }
-    if let Some(m) = ack_it {
-        tokio::spawn(ack(channel, m));
     }
 }
 
@@ -294,11 +273,29 @@ pub fn render(d: &Value) -> Msg {
         let who = Value::Object(r.clone());
         text = format!("(reply to {}) {text}", author_name(&who));
     }
+    let mut files = Vec::new();
     for a in d["attachments"].as_array().into_iter().flatten() {
-        text += &format!(" [file: {}]", a["filename"].as_str().unwrap_or("?"));
+        let name = a["filename"].as_str().unwrap_or("?");
+        let image = a["content_type"].as_str().is_some_and(|t| t.starts_with("image/"))
+            || [".png", ".jpg", ".jpeg", ".gif", ".webp"].iter().any(|x| name.to_lowercase().ends_with(x));
+        let label = format!("[{}: {name}]", if image { "image" } else { "file" });
+        text += &format!(" {label}");
+        if let Some(url) = a["url"].as_str() {
+            files.push((label, url.to_string()));
+        }
     }
     for e in d["embeds"].as_array().into_iter().flatten() {
-        if let Some(t) = e["title"].as_str().or_else(|| e["description"].as_str()) {
+        let kind = e["type"].as_str().unwrap_or("");
+        // GIFs (Tenor etc.) and image links: open the original link.
+        let link = match kind {
+            "gifv" | "image" => e["url"].as_str(),
+            _ => e["image"]["url"].as_str(),
+        };
+        if let Some(url) = link {
+            let label = if kind == "gifv" { "[gif]".to_string() } else { "[image]".to_string() };
+            text += &format!(" {label}");
+            files.push((label, url.to_string()));
+        } else if let Some(t) = e["title"].as_str().or_else(|| e["description"].as_str()) {
             let t: String = t.chars().take(80).collect();
             text += &format!(" [{t}]");
         }
@@ -313,7 +310,7 @@ pub fn render(d: &Value) -> Msg {
         (true, _) => "[message]".to_string(),
         (false, _) => text.trim().to_string(),
     };
-    Msg { id: mid, author: author_name(d), text }
+    Msg { id: mid, author: author_name(d), text, files }
 }
 
 /// Discord's markup to readable text: <@id> -> @name, <#id> -> #channel,
@@ -447,12 +444,13 @@ mod tests {
             "id": "1", "content": "hi <@42> see <:pog:123> and <t:0>",
             "author": {"id": "7", "username": "bob"},
             "mentions": [{"id": "42", "username": "miles", "global_name": "Miles"}],
-            "attachments": [{"filename": "a.png"}],
+            "attachments": [{"filename": "a.png", "url": "https://cdn.example/a.png"}],
         });
         let m = render(&d);
         assert_eq!(m.author, "bob");
         assert!(m.text.starts_with("hi @Miles see :pog: and 1970-01-01 00:00"), "{}", m.text);
-        assert!(m.text.ends_with("[file: a.png]"));
+        assert!(m.text.ends_with("[image: a.png]"), "{}", m.text);
+        assert_eq!(m.files, vec![("[image: a.png]".to_string(), "https://cdn.example/a.png".to_string())]);
     }
 
     #[test]

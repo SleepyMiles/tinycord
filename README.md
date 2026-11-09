@@ -88,7 +88,12 @@ It leaves voice, disconnects, and deletes the saved token.
 - Press **Chat** (main window) to open the chat window. Pick **Direct
   messages** or a server, then a channel. Type and press **Enter** to send.
 - The last 50 messages load when you open a channel; new ones appear live.
-  Images and files show as `[file: name]`, embeds as their title.
+  Pictures and files show as `[image: name]` / `[file: name]` (GIFs as
+  `[gif]`): **click one to open it** in your browser or photo viewer.
+- **Sending is the riskiest thing tinycord does.** Discord says using your
+  account token in another app "may result in account suspension or
+  termination", and its automated system flags it. Check
+  **User Settings > My Account > Standing** if Discord warns you.
 - Chat only uses memory while its window is open: at most 200 messages as
   plain text. Closing it frees them.
 - **Pings:** when someone mentions you (or @everyone/@here) or sends you a

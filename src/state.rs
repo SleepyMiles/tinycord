@@ -67,6 +67,8 @@ pub struct Msg {
     pub id: u64,
     pub author: String,
     pub text: String,
+    /// Pictures and files in it: (label shown in `text`, link to open).
+    pub files: Vec<(String, String)>,
 }
 
 /// The chat that's open (only while the chat window is).

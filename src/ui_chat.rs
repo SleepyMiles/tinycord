@@ -12,7 +12,9 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::Controls::{EM_GETFIRSTVISIBLELINE, EM_LINESCROLL, EM_SETLIMITTEXT};
+use windows_sys::Win32::UI::Controls::{
+    EM_CHARFROMPOS, EM_GETFIRSTVISIBLELINE, EM_GETSEL, EM_LINEINDEX, EM_LINESCROLL, EM_SETLIMITTEXT,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -40,6 +42,65 @@ struct ChatUi {
     guild_ids: Vec<u64>,
     chan_ids: Vec<u64>,
     shown: Option<(u64, u64)>, // (channel, version) on screen
+    /// Clickable [image]/[file] labels in the message box: UTF-16 range, link.
+    links: Vec<(usize, usize, String)>,
+    hover: bool,
+}
+
+/// The message box's own window procedure (we watch clicks on links).
+static EDIT_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Character under a point in the message box (also past 65535 characters,
+/// where the control's own answer wraps around).
+unsafe fn char_at(edit: HWND, lp: LPARAM) -> usize {
+    let r = SendMessageW(edit, EM_CHARFROMPOS, 0, lp) as usize;
+    let (lo, line) = (r & 0xFFFF, (r >> 16) & 0xFFFF);
+    let start = SendMessageW(edit, EM_LINEINDEX, line, 0).max(0) as usize;
+    let mut c = (start & !0xFFFF) | lo;
+    if c < start {
+        c += 0x10000;
+    }
+    c
+}
+
+fn link_at(pos: usize) -> Option<String> {
+    with(|c| c.links.iter().find(|(s, e, _)| pos >= *s && pos < *e).map(|l| l.2.clone())).flatten()
+}
+
+unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let old: WNDPROC = std::mem::transmute(EDIT_PROC.load(std::sync::atomic::Ordering::Relaxed));
+    match msg {
+        WM_MOUSEMOVE => {
+            let on = link_at(char_at(hwnd, lp)).is_some();
+            with(|c| c.hover = on);
+        }
+        WM_SETCURSOR if with(|c| c.hover) == Some(true) => {
+            SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+            return 1;
+        }
+        WM_LBUTTONUP => {
+            let r = CallWindowProcW(old, hwnd, msg, wp, lp);
+            let (mut s, mut e) = (0u32, 0u32);
+            SendMessageW(hwnd, EM_GETSEL, &mut s as *mut u32 as WPARAM, &mut e as *mut u32 as LPARAM);
+            // A plain click (not selecting text) on a picture opens it.
+            if s == e {
+                if let Some(url) = link_at(char_at(hwnd, lp)) {
+                    if url.starts_with("https://") || url.starts_with("http://") {
+                        let verb = wide("open");
+                        let u = wide(&url);
+                        ShellExecuteW(null_mut(), verb.as_ptr(), u.as_ptr(), null(), null(), SW_SHOWNORMAL);
+                    }
+                }
+            }
+            return r;
+        }
+        _ => {}
+    }
+    CallWindowProcW(old, hwnd, msg, wp, lp)
 }
 
 thread_local! {
@@ -48,8 +109,10 @@ thread_local! {
     static SHOWN_PING: Cell<u64> = const { Cell::new(0) };
 }
 
+/// The chat window's data. None if it's closed, or busy further up the
+/// call stack (a message can arrive in the middle of laying it out).
 fn with<R>(f: impl FnOnce(&mut ChatUi) -> R) -> Option<R> {
-    CHAT.with(|c| c.borrow_mut().as_mut().map(f))
+    CHAT.with(|c| c.try_borrow_mut().ok().and_then(|mut g| g.as_mut().map(f)))
 }
 
 pub fn hwnd() -> HWND {
@@ -149,6 +212,8 @@ unsafe fn build(hwnd: HWND) {
         font,
     );
     SendMessageW(msgs, EM_SETLIMITTEXT, 1 << 22, 0);
+    let old = SetWindowLongPtrW(msgs, GWLP_WNDPROC, edit_proc as usize as isize);
+    EDIT_PROC.store(old, std::sync::atomic::Ordering::Relaxed);
     let status = child(hwnd, "STATIC", "", 0, 0, 0, 10, 10, ID_STATUS, dpi, font);
     let input = child(hwnd, "EDIT", "", ts | ES_AUTOHSCROLL as u32 | WS_BORDER, 0, 0, 10, 10, ID_INPUT, dpi, font);
     SendMessageW(input, EM_SETLIMITTEXT, 2000, 0); // Discord's limit
@@ -166,6 +231,8 @@ unsafe fn build(hwnd: HWND) {
             guild_ids: Vec::new(),
             chan_ids: Vec::new(),
             shown: None,
+            links: Vec::new(),
+            hover: false,
         })
     });
     fill_servers();
@@ -317,11 +384,27 @@ pub unsafe fn update() {
             return;
         }
         let mut t = String::new();
+        let mut at = 0; // UTF-16 position (what the control counts)
+        let mut links = Vec::new();
         for m in &c.msgs {
             let body = m.text.replace("\r\n", "\n").replace('\n', "\r\n      ");
-            t += &format!("[{}] {}: {}\r\n", chat::time_of(m.id), m.author, body);
+            let head = format!("[{}] {}: ", chat::time_of(m.id), m.author);
+            for (label, url) in &m.files {
+                if let Some(p) = body.rfind(label.as_str()) {
+                    let s = at + utf16_len(&head) + utf16_len(&body[..p]);
+                    links.push((s, s + utf16_len(label), url.clone()));
+                }
+            }
+            let line = format!("{head}{body}\r\n");
+            at += utf16_len(&line);
+            t += &line;
         }
-        (key, t, c.status.clone())
+        let mut note = c.status.clone();
+        if note.is_empty() && !links.is_empty() {
+            note = "Click an [image] or [file] to open it.".into();
+        }
+        with(|ui| ui.links = links);
+        (key, t, note)
     };
     with(|c| c.shown = Some(key));
     // Stay where you are if you scrolled up to read; else follow new messages.
