@@ -474,7 +474,7 @@ impl Pipeline {
         sender.send_ws(video.to_string());
         sender.send_ws(json!({"op": 5, "d": {"speaking": 1, "delay": 0, "ssrc": sender.audio_ssrc}}).to_string());
 
-        let slot = Arc::new(Slot::<Frame>::new());
+        let slot = Arc::new(Slot::<Job>::new());
         let (free_tx, free_rx) = mpsc::channel::<I420>();
         let (enc_tx, enc_rx) = mpsc::channel::<Encoded>();
         let t0 = Instant::now();
@@ -535,7 +535,36 @@ fn live_mut(f: impl FnOnce(&mut Live)) {
 
 // ---------------------------------------------------------------- capture
 
-fn capture_thread(cfg: LiveCfg, sh: Arc<Shared>, slot: Arc<Slot<Frame>>, free: mpsc::Receiver<I420>) {
+/// What the capture clock hands the encoder on each tick.
+enum Job {
+    /// A new picture.
+    New(Frame),
+    /// Nothing changed: send the last picture again, stamped with this tick.
+    Repeat(Instant),
+}
+
+/// Hand a job to the encoder. A new picture that's still waiting is never
+/// replaced by a repeat (only by a newer picture, which is returned here so
+/// its buffer can be reused).
+fn post(slot: &Slot<Job>, job: Job) -> Option<Frame> {
+    let mut g = slot.item.lock().unwrap();
+    if matches!((&*g, &job), (Some(Job::New(_)), Job::Repeat(_))) {
+        return None;
+    }
+    let old = g.replace(job);
+    drop(g);
+    slot.cv.notify_one();
+    match old {
+        Some(Job::New(f)) => Some(f),
+        _ => None,
+    }
+}
+
+/// The stream's clock: exactly `fps` ticks a second. On each tick, take the
+/// newest screen picture if anything changed (Windows collects all changes
+/// since the last look), otherwise ask for a repeat. Viewers get a steady
+/// frame rate whatever is on screen.
+fn capture_thread(cfg: LiveCfg, sh: Arc<Shared>, slot: Arc<Slot<Job>>, free: mpsc::Receiver<I420>) {
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::UI::HiDpi::*;
@@ -545,17 +574,20 @@ fn capture_thread(cfg: LiveCfg, sh: Arc<Shared>, slot: Arc<Slot<Frame>>, free: m
     let interval = Duration::from_secs_f64(1.0 / cfg.fps.max(1) as f64);
     let mut cap: Option<Capturer> = None;
     let mut retry_at = Instant::now();
-    let mut next = Instant::now();
+    let mut tick = Instant::now();
     let mut scaled = Vec::new();
     let mut spare: Vec<I420> = Vec::new();
     let mut failed_note = false;
     while !sh.stop.load(Ordering::Relaxed) {
-        if cap.is_none() {
-            let now = Instant::now();
-            if now < retry_at {
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
+        tick += interval;
+        let now = Instant::now();
+        if tick + interval < now {
+            tick = now; // fell far behind (PC busy): restart the clock
+        } else if tick > now {
+            std::thread::sleep(tick - now);
+        }
+
+        if cap.is_none() && Instant::now() >= retry_at {
             match Capturer::new(cfg.monitor) {
                 Ok(c) => {
                     cap = Some(c);
@@ -564,30 +596,27 @@ fn capture_thread(cfg: LiveCfg, sh: Arc<Shared>, slot: Arc<Slot<Frame>>, free: m
                         failed_note = false;
                     }
                 }
-                Err(CapErr::Lost) => retry_at = now + Duration::from_millis(300),
+                Err(CapErr::Lost) => retry_at = Instant::now() + Duration::from_millis(300),
                 Err(CapErr::Failed(msg)) => {
                     set_status(format!("Screen capture: {msg}"));
                     failed_note = true;
-                    retry_at = now + Duration::from_secs(3);
+                    retry_at = Instant::now() + Duration::from_secs(3);
                 }
             }
-            continue;
         }
-        let now = Instant::now();
-        if now < next {
-            std::thread::sleep(next - now);
-        }
-        let c = cap.as_mut().unwrap();
-        match c.next(100) {
-            Ok(false) => continue, // nothing changed; the encoder repeats the last picture
-            Ok(true) => {}
-            Err(_) => {
-                cap = None;
-                continue;
+        let changed = match cap.as_mut().map(|c| c.next(0)) {
+            Some(Ok(changed)) => changed,
+            Some(Err(_)) => {
+                cap = None; // screen went away for a moment; viewers keep the last picture
+                false
             }
-        }
+            None => false,
+        };
+        let Some(c) = cap.as_ref().filter(|_| changed) else {
+            post(&slot, Job::Repeat(tick));
+            continue;
+        };
         let t = Instant::now();
-        next = if t.saturating_duration_since(next) < interval { next + interval } else { t + interval };
         while let Ok(p) = free.try_recv() {
             spare.push(p);
         }
@@ -612,11 +641,12 @@ fn capture_thread(cfg: LiveCfg, sh: Arc<Shared>, slot: Arc<Slot<Frame>>, free: m
         sh.st.capture_us_max.fetch_max(us, Ordering::Relaxed);
         if done.is_some() {
             sh.st.captured.fetch_add(1, Ordering::Relaxed);
-            if let Some(old) = slot.put(Frame { pic, at: t }) {
+            if let Some(old) = post(&slot, Job::New(Frame { pic, at: tick })) {
                 spare.push(old.pic);
             }
         } else {
             spare.push(pic);
+            post(&slot, Job::Repeat(tick));
         }
         spare.truncate(2);
     }
@@ -632,7 +662,9 @@ fn encoder_config(fps: u32, bitrate: u32) -> openh264::encoder::EncoderConfig {
         .rate_control_mode(RateControlMode::Bitrate)
         .bitrate(BitRate::from_bps(bitrate))
         .max_frame_rate(FrameRate::from_hz(fps as f32))
-        .skip_frames(true)
+        // Never drop frames to save bitrate (that's what made the frame rate
+        // jump around); the encoder lowers quality a little instead.
+        .skip_frames(false)
         .complexity(Complexity::Low)
         .num_threads(threads as u16)
         // A few slices let the encoder use several cores. Not more: the
@@ -648,7 +680,7 @@ fn encode_thread(
     cfg: LiveCfg,
     sh: Arc<Shared>,
     sender: Arc<MediaSender>,
-    slot: Arc<Slot<Frame>>,
+    slot: Arc<Slot<Job>>,
     free: mpsc::Sender<I420>,
     out: mpsc::Sender<Encoded>,
     t0: Instant,
@@ -663,21 +695,21 @@ fn encode_thread(
     let mut need_idr = true;
     let mut pk = VideoPacketizer::new(sh.video_ssrc);
     let mut last_at = t0;
-    // When the screen doesn't change (most desktop apps), the last picture
-    // is sent again at a steady 15 fps. Discord's player treats long gaps
-    // between frames as a freeze and shows the stream as stuck or loading.
-    let repeat = Duration::from_secs_f64(1.0 / cfg.fps.clamp(1, 15) as f64);
+    // The capture clock sends a job every tick; this only matters if it
+    // stalls (then keep the stream alive with repeats).
+    let stall = Duration::from_millis(200);
     while !sh.stop.load(Ordering::Relaxed) {
-        let at = match slot.take(repeat) {
-            Some(f) => {
+        let at = match slot.take(stall) {
+            Some(Job::New(f)) => {
                 let at = f.at;
                 if let Some(old) = last.replace(f) {
                     let _ = free.send(old.pic);
                 }
                 at
             }
+            Some(Job::Repeat(t)) if last.is_some() => t,
             None if last.is_some() => Instant::now(),
-            None => continue,
+            _ => continue,
         };
         // Timestamps must only go forward.
         let at = at.max(last_at + Duration::from_millis(1));
@@ -1264,5 +1296,54 @@ mod e2ee_budget {
             println!("{w}x{h}: at most {worst} NAL units per frame (largest frame {} KB)", biggest / 1024);
             assert!(worst <= 8, "{w}x{h}: {worst} NAL units in one frame");
         }
+    }
+}
+
+#[cfg(test)]
+mod clock {
+    use super::*;
+
+    /// The capture clock hands the encoder exactly `fps` jobs a second, with
+    /// evenly spaced timestamps, whether or not the screen changes.
+    #[test]
+    fn steady_ticks() {
+        let fps = 30;
+        let cfg = LiveCfg { monitor: 0, height: 480, fps, sound: false };
+        let sh = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            video_ssrc: 1,
+            keyframe: AtomicBool::new(false),
+            nacks: Mutex::new(Vec::new()),
+            bitrate: AtomicU32::new(0),
+            fps,
+            size: AtomicU32::new(0),
+            frames: AtomicU32::new(0),
+            bytes: AtomicU64::new(0),
+            loss: Mutex::new(Vec::new()),
+            remb: AtomicU64::new(0),
+            st: Stats::default(),
+        });
+        let slot = Arc::new(Slot::<Job>::new());
+        let (_free_tx, free_rx) = mpsc::channel::<I420>();
+        let t = {
+            let (sh, slot) = (sh.clone(), slot.clone());
+            std::thread::spawn(move || capture_thread(cfg, sh, slot, free_rx))
+        };
+        let start = Instant::now();
+        let mut stamps = Vec::new();
+        while start.elapsed() < Duration::from_secs(2) {
+            match slot.take(Duration::from_millis(100)) {
+                Some(Job::New(f)) => stamps.push(f.at),
+                Some(Job::Repeat(at)) => stamps.push(at),
+                None => {}
+            }
+        }
+        sh.stop.store(true, Ordering::Relaxed);
+        t.join().unwrap();
+        let gaps: Vec<f64> = stamps.windows(2).map(|w| (w[1] - w[0]).as_secs_f64() * 1000.0).collect();
+        let n = stamps.len();
+        println!("{n} jobs in 2 s; gaps min {:.2} ms max {:.2} ms", gaps.iter().cloned().fold(f64::MAX, f64::min), gaps.iter().cloned().fold(0.0, f64::max));
+        assert!((55..=61).contains(&n), "{n} jobs");
+        assert!(gaps.iter().all(|g| (g - 1000.0 / fps as f64).abs() < 0.5), "uneven: {gaps:?}");
     }
 }
