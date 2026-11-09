@@ -49,6 +49,11 @@ pub fn load_settings() {
             "ptt_key" => s.ptt_key = v.trim().parse().unwrap_or(0),
             "overlay" => s.overlay = v.trim().parse().unwrap_or(2).min(crate::state::OVERLAY_MAX),
             "on_top" => s.keep_on_top = v.trim() == "1",
+            "chat_last" => {
+                if let Some((g, c)) = v.trim().split_once(':') {
+                    s.chat_last = (g.parse().unwrap_or(0), c.parse().unwrap_or(0));
+                }
+            }
             "speakers_only" => s.overlay_speakers_only = v.trim() == "1",
             "guild" => s.selected_guild = v.trim().parse().unwrap_or(0),
             "mic" => {
@@ -109,7 +114,7 @@ pub fn save_settings() {
         crate::voice::shared().vad_db.load(std::sync::atomic::Ordering::Relaxed),
     );
     let text = format!(
-        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\nns_strength={}\nclarity={}\nstream_volume={}\nstream_pin={}\nlive_monitor={}\nlive_res={}\nlive_fps={}\nlive_sound={}\nlive_quality={}\non_top={}\n",
+        "mode={}\nptt_key={}\noverlay={}\nspeakers_only={}\nguild={}\nvad_db={}\nnoise_suppression={}\nauto_gain={}\n{}speakers={}\ninput_volume={}\nns_strength={}\nclarity={}\nstream_volume={}\nstream_pin={}\nlive_monitor={}\nlive_res={}\nlive_fps={}\nlive_sound={}\nlive_quality={}\non_top={}\nchat_last={}:{}\n",
         match s.mode {
             MicMode::Open => "open",
             MicMode::Voice => "voice",
@@ -135,6 +140,8 @@ pub fn save_settings() {
         s.live_cfg.sound as u8,
         s.live_cfg.quality,
         s.keep_on_top as u8,
+        s.chat_last.0,
+        s.chat_last.1,
     );
     drop(s);
     let _ = std::fs::write(dir().join("settings.txt"), text);

@@ -20,6 +20,8 @@ pub struct Guild {
     pub id: u64,
     pub name: String,
     pub voice: Vec<Chan>,
+    /// Channels with text chat, in Discord's order.
+    pub text: Vec<TextChan>,
     /// Server boost level 0-3 (raises Go Live quality for everyone).
     pub boost: u8,
 }
@@ -40,6 +42,61 @@ pub struct Watching {
     pub user: u64,
     pub name: String,
     pub status: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TextChan {
+    pub id: u64,
+    pub name: String,
+    /// 0 text, 2 voice (chat in voice), 5 announcements.
+    pub kind: u8,
+}
+
+/// A direct message or group chat.
+#[derive(Clone, Debug)]
+pub struct Dm {
+    pub id: u64,
+    pub name: String,
+    /// Newest message id (for sorting, newest first).
+    pub last: u64,
+}
+
+/// One chat message, ready to show.
+#[derive(Clone, Debug)]
+pub struct Msg {
+    pub id: u64,
+    pub author: String,
+    pub text: String,
+}
+
+/// The chat that's open (only while the chat window is).
+#[derive(Clone, Debug, Default)]
+pub struct Chat {
+    pub guild: u64,
+    pub channel: u64,
+    pub msgs: Vec<Msg>,
+    pub status: String,
+    /// Changes whenever something in here changes (the window redraws).
+    pub version: u64,
+}
+
+/// Someone mentioned you or sent a DM.
+#[derive(Clone, Debug)]
+pub struct Ping {
+    pub guild: u64,
+    pub channel: u64,
+    pub title: String,
+    pub text: String,
+}
+
+/// Your Discord notification settings that matter for pings.
+#[derive(Clone, Debug, Default)]
+pub struct NotifySettings {
+    pub muted_guilds: HashSet<u64>,
+    pub muted_channels: HashSet<u64>,
+    pub no_everyone: HashSet<u64>,
+    /// Servers set to "Nothing".
+    pub silent_guilds: HashSet<u64>,
 }
 
 /// Go Live settings.
@@ -101,6 +158,15 @@ pub struct State {
     pub watching: Option<Watching>,
     /// Our Go Live stream, while it's on.
     pub live: Option<Live>,
+    pub dms: Vec<Dm>,
+    pub chat: Option<Chat>,
+    /// Pings not looked at yet (newest last).
+    pub pings: Vec<Ping>,
+    /// Counts every ping ever (the UI shows a notification for new ones).
+    pub ping_seq: u64,
+    pub notify: NotifySettings,
+    /// (guild, channel) of the chat opened last.
+    pub chat_last: (u64, u64),
     pub live_cfg: LiveCfg,
     /// Nitro: 0 none, 1 Classic, 2 Nitro, 3 Basic.
     pub premium: u8,
@@ -178,6 +244,12 @@ fn cell() -> &'static Mutex<State> {
             joined: None,
             watching: None,
             live: None,
+            dms: Vec::new(),
+            chat: None,
+            pings: Vec::new(),
+            ping_seq: 0,
+            notify: NotifySettings::default(),
+            chat_last: (0, 0),
             live_cfg: LiveCfg::default(),
             premium: 0,
             voice_ready: false,
@@ -218,6 +290,10 @@ pub enum Cmd {
     StopLive,
     /// Leave voice, disconnect and forget the saved token.
     Logout,
+    /// Show this channel's chat (guild 0 = a DM).
+    ChatOpen(u64, u64),
+    ChatClose,
+    ChatSend(u64, String),
 }
 
 /// Highest overlay position number (see `State::overlay`).

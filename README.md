@@ -1,8 +1,8 @@
 # tinycord
 
-A voice-only Discord client for Windows, in the spirit of old TeamSpeak.
-A small native window, plus an always-on-top "who's talking" overlay.
-It has no text chat, no images, and no browser engine.
+A small Discord client for Windows, in the spirit of old TeamSpeak: voice,
+an always-on-top "who's talking" overlay, Go Live, and text chat that only
+exists while you open it. No images and no browser engine.
 
 > **Warning:** Discord doesn't allow third-party clients on normal accounts.
 > Using one can get the account banned. Use it at your own risk.
@@ -82,6 +82,22 @@ It leaves voice, disconnects, and deletes the saved token.
   the bitrate a little; it raises it again when things are clean.
 - Screen capture, encoder and buffers only exist while you're live. When you
   stop, they're freed.
+
+## Text chat
+
+- Press **Chat** (main window) to open the chat window. Pick **Direct
+  messages** or a server, then a channel. Type and press **Enter** to send.
+- The last 50 messages load when you open a channel; new ones appear live.
+  Images and files show as `[file: name]`, embeds as their title.
+- Chat only uses memory while its window is open: at most 200 messages as
+  plain text. Closing it frees them.
+- **Pings:** when someone mentions you (or @everyone/@here) or sends you a
+  DM, Windows shows a notification and the taskbar button blinks. Click the
+  notification to open that chat. The **Chat** button shows how many you
+  haven't looked at, and the server/channel lists mark them with `(@n)`.
+  Servers or channels you muted in Discord (or set to "Nothing") don't ping.
+- In fullscreen games, Windows may hold notifications until you're back
+  (Focus Assist / Do Not Disturb).
 
 ## Overlay over Valorant
 

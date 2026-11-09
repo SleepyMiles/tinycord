@@ -2,8 +2,9 @@
 //! two events voice needs (VOICE_STATE_UPDATE, VOICE_SERVER_UPDATE).
 //! Text messages, presences and everything else are ignored.
 
-use crate::state::{self, state, Chan, Cmd, Guild, VoiceSt};
-use crate::{golive, store, stream, voice};
+use crate::state::{self, state, Chan, Cmd, Dm, Guild, TextChan, VoiceSt};
+use std::collections::HashMap;
+use crate::{chat, golive, store, stream, voice};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use songbird::id::{ChannelId, GuildId, UserId};
@@ -68,7 +69,12 @@ fn forget_account(v: &mut Option<voice::Voice>, pend: &mut Pending) {
     s.names.clear();
     s.nicks.clear();
     s.speaking.clear();
+    s.dms.clear();
+    s.pings.clear();
+    s.notify = Default::default();
     drop(s);
+    chat::close();
+    chat::set_token(None);
     state::changed();
 }
 
@@ -102,6 +108,7 @@ pub async fn run(mut rx: UnboundedReceiver<Cmd>) {
         };
 
         state::set_status("Connecting...");
+        chat::set_token(Some(tok.clone()));
         let end = session(&tok, &mut sess, &mut pend, &mut v, &mut rx).await;
         match end {
             End::Reconnect => tokio::time::sleep(Duration::from_secs(2)).await,
@@ -384,6 +391,9 @@ async fn command(cmd: Cmd, pend: &mut Pending, v: &mut Option<voice::Voice>, out
         Cmd::GoLive(cfg) => go_live(cfg, out).await,
         Cmd::StopLive => stop_live(out).await,
         Cmd::Logout => {} // handled by the session loop
+        Cmd::ChatOpen(g, c) => chat::open(g, c),
+        Cmd::ChatClose => chat::close(),
+        Cmd::ChatSend(c, text) => chat::send(c, text),
         Cmd::Leave => {
             stop_watch(out).await;
             stop_live(out).await;
@@ -488,7 +498,61 @@ fn parse_guild(g: &Value) -> Option<Guild> {
         .or_else(|| g["properties"]["premium_tier"].as_u64())
         .unwrap_or(0)
         .min(3) as u8;
-    Some(Guild { id: gid, name, voice, boost })
+    let text = text_channels(g["channels"].as_array().map(|v| v.as_slice()).unwrap_or(&[]));
+    Some(Guild { id: gid, name, voice, boost, text })
+}
+
+/// Channels with chat (text, announcements, chat in voice), in Discord's
+/// order: channels outside categories first, then category by category.
+fn text_channels(cs: &[Value]) -> Vec<TextChan> {
+    let cat_pos: HashMap<u64, i64> = cs
+        .iter()
+        .filter(|c| c["type"].as_u64() == Some(4))
+        .map(|c| (id(&c["id"]), c["position"].as_i64().unwrap_or(0)))
+        .collect();
+    let mut v: Vec<((i64, u8, i64), TextChan)> = cs
+        .iter()
+        .filter_map(|c| {
+            let kind = c["type"].as_u64()? as u8;
+            if !matches!(kind, 0 | 2 | 5) {
+                return None;
+            }
+            let cat = cat_pos.get(&id(&c["parent_id"])).copied().unwrap_or(-1);
+            // Inside a category Discord lists text channels before voice.
+            let key = (cat, (kind == 2) as u8, c["position"].as_i64().unwrap_or(0));
+            Some((key, TextChan { id: id(&c["id"]), name: c["name"].as_str().unwrap_or("?").to_string(), kind }))
+        })
+        .collect();
+    v.sort_by_key(|(k, _)| *k);
+    v.into_iter().map(|(_, c)| c).collect()
+}
+
+/// A DM or group chat from READY / CHANNEL_CREATE.
+fn parse_dm(c: &Value) -> Option<Dm> {
+    let kind = c["type"].as_u64()?;
+    if kind != 1 && kind != 3 {
+        return None;
+    }
+    let names: Vec<String> = c["recipients"]
+        .as_array()
+        .map(|r| {
+            r.iter()
+                .map(|u| u["global_name"].as_str().or_else(|| u["username"].as_str()).unwrap_or("?").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let names = if names.is_empty() {
+        // Newer READY: only ids, names are in READY's users list.
+        let s = state();
+        c["recipient_ids"]
+            .as_array()
+            .map(|r| r.iter().map(|u| s.names.get(&id(u)).cloned().unwrap_or_else(|| "?".into())).collect())
+            .unwrap_or_default()
+    } else {
+        names
+    };
+    let name = c["name"].as_str().filter(|n| !n.is_empty()).map(String::from).unwrap_or_else(|| names.join(", "));
+    Some(Dm { id: id(&c["id"]), name, last: id(&c["last_message_id"]) })
 }
 
 fn upsert_guild(gd: Guild) {
@@ -559,8 +623,12 @@ async fn dispatch(
                     }
                 }
             }
+            let mut dms: Vec<Dm> = d["private_channels"].as_array().into_iter().flatten().filter_map(parse_dm).collect();
+            dms.sort_by(|a, b| b.last.cmp(&a.last));
             {
                 let mut s = state();
+                s.dms = dms;
+                s.notify = chat::parse_settings(&d["user_guild_settings"]);
                 s.guilds.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
                 s.logged_in = true;
                 s.status = format!("Logged in as {me_name}");
@@ -605,8 +673,20 @@ async fn dispatch(
         "CHANNEL_CREATE" | "CHANNEL_UPDATE" | "CHANNEL_DELETE" => {
             let gid = id(&d["guild_id"]);
             let cid = id(&d["id"]);
+            let dm = if t != "CHANNEL_DELETE" { parse_dm(d) } else { None };
             let mut s = state();
+            s.dms.retain(|x| x.id != cid || (t != "CHANNEL_DELETE" && dm.is_none()));
+            if let Some(dm) = dm {
+                s.dms.retain(|x| x.id != dm.id);
+                s.dms.insert(0, dm);
+            }
             if let Some(g) = s.guilds.iter_mut().find(|g| g.id == gid) {
+                g.text.retain(|c| c.id != cid);
+                if t != "CHANNEL_DELETE" {
+                    if let Some(kind) = d["type"].as_u64().map(|k| k as u8).filter(|k| matches!(k, 0 | 2 | 5)) {
+                        g.text.push(TextChan { id: cid, name: d["name"].as_str().unwrap_or("?").to_string(), kind });
+                    }
+                }
                 g.voice.retain(|c| c.id != cid);
                 if t != "CHANNEL_DELETE" && d["type"].as_u64() == Some(2) {
                     g.voice.push(Chan {
@@ -620,6 +700,21 @@ async fn dispatch(
             }
             drop(s);
             state::changed();
+        }
+        "MESSAGE_CREATE" | "MESSAGE_UPDATE" | "MESSAGE_DELETE" => chat::on_event(t, d),
+        "USER_GUILD_SETTINGS_UPDATE" => {
+            // One server's settings changed: replace just that server's.
+            let g = id(&d["guild_id"]);
+            let one = chat::parse_settings(&json!([d]));
+            let mut s = state();
+            let n = &mut s.notify;
+            for set in [&mut n.muted_guilds, &mut n.no_everyone, &mut n.silent_guilds] {
+                set.remove(&g);
+            }
+            n.muted_guilds.extend(one.muted_guilds);
+            n.no_everyone.extend(one.no_everyone);
+            n.silent_guilds.extend(one.silent_guilds);
+            n.muted_channels.extend(one.muted_channels);
         }
         "GUILD_MEMBERS_CHUNK" => {
             let gid = id(&d["guild_id"]);

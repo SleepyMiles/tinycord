@@ -2,6 +2,7 @@
 
 mod audio;
 mod capture;
+mod chat;
 mod convert;
 mod gateway;
 mod golive;
@@ -12,6 +13,8 @@ mod stream;
 mod sysaudio;
 #[cfg(any(windows, wincheck))]
 mod ui;
+#[cfg(any(windows, wincheck))]
+mod ui_chat;
 #[cfg(any(windows, wincheck))]
 mod ui_live;
 mod video;

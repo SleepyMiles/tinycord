@@ -3909,6 +3909,7 @@ dependencies = [
  "nnnoiseless",
  "openh264",
  "parking_lot 0.12.5",
+ "reqwest",
  "rubato",
  "serde_json",
  "songbird",

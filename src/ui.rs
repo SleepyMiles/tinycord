@@ -40,6 +40,7 @@ const ID_VOL: i32 = 118;
 const ID_NSLVL: i32 = 119;
 const ID_LIVE: i32 = 120;
 const ID_LOGOUT: i32 = 121;
+const ID_CHAT: i32 = 122;
 
 const TIMER_REFRESH: usize = 1;
 const TIMER_TOPMOST: usize = 2;
@@ -74,7 +75,7 @@ struct Row {
 struct Ui {
     hwnd: HWND,
     overlay: HWND,
-    c: [HWND; 22],
+    c: [HWND; 23],
     font: HFONT,
     bold: HFONT,
     ofont: HFONT,
@@ -238,12 +239,13 @@ pub fn run() {
             *f = Some(view_repaint);
         }
         crate::ui_live::register(hinst);
+        crate::ui_chat::register(hinst);
 
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
                 hwnd: null_mut(),
                 overlay: null_mut(),
-                c: [null_mut(); 22],
+                c: [null_mut(); 23],
                 font: make_font(dpi, 9, FW_NORMAL as i32),
                 bold: make_font(dpi, 9, FW_BOLD as i32),
                 ofont: make_font(dpi, 11, FW_SEMIBOLD as i32),
@@ -308,6 +310,10 @@ pub fn run() {
             if !lw.is_null() && IsDialogMessageW(lw, &msg) != 0 {
                 continue;
             }
+            let cw = crate::ui_chat::hwnd();
+            if !cw.is_null() && IsDialogMessageW(cw, &msg) != 0 {
+                continue;
+            }
             if IsDialogMessageW(hwnd, &msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -366,7 +372,7 @@ unsafe fn create_controls(hwnd: HWND) {
     let cbo = |x, y, w, id| {
         child(hwnd, "COMBOBOX", "", ts | WS_VSCROLL | CBS_DROPDOWNLIST as u32, x, y, w, 300, id, dpi, font)
     };
-    let mut c = [null_mut(); 22];
+    let mut c = [null_mut(); 23];
     c[0] = child(hwnd, "STATIC", "Starting...", SS_LEFT as u32 | SS_ENDELLIPSIS as u32, 6, 6, 268, 18, ID_STATUS, dpi, font);
     c[1] = child(hwnd, "EDIT", "", ts | ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32, 6, 28, 190, 24, ID_TOKEN, dpi, font);
     c[2] = b("Log in", BS_PUSHBUTTON, 202, 28, 72, 24, ID_LOGIN);
@@ -399,6 +405,7 @@ unsafe fn create_controls(hwnd: HWND) {
     c[14] = b("Clarity boost", BS_AUTOCHECKBOX, 8, 432, 128, 22, ID_NS);
     c[15] = b("Auto gain", BS_AUTOCHECKBOX, 144, 432, 128, 22, ID_AGC);
     c[13] = b("Keep on top", BS_AUTOCHECKBOX, 8, 456, 128, 22, ID_TOP);
+    c[22] = b("Chat", BS_PUSHBUTTON, 142, 454, 132, 24, ID_CHAT);
     c[16] = cbo(6, 480, 130, ID_MIC);
     c[17] = cbo(142, 480, 132, ID_SPKDEV);
     SendMessageW(c[16], CB_SETDROPPEDWIDTH, sc(dpi, 320) as usize, 0);
@@ -476,7 +483,12 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             DestroyWindow(hwnd);
             0
         }
+        crate::ui_chat::WM_TRAY => {
+            crate::ui_chat::on_tray(lp);
+            0
+        }
         WM_DESTROY => {
+            crate::ui_chat::remove_tray();
             store::save_settings();
             if state().joined.is_some() {
                 state::send(Cmd::Leave);
@@ -594,6 +606,7 @@ unsafe fn on_command(id: i32, code: u32) {
             store::save_settings();
             state::send(Cmd::RestartAudio);
         }
+        (ID_CHAT, BN_CLICKED) => crate::ui_chat::open(None),
         (ID_LOGOUT, BN_CLICKED) => {
             let Some(h) = with_ui(|u| u.hwnd) else { return };
             let text = wide("Log out of this Discord account?\n\nYou'll need to paste a token to log in again.");
@@ -843,6 +856,8 @@ unsafe fn refresh() {
     SendMessageW(c[6], BM_SETCHECK, muted as usize, 0);
     SendMessageW(c[7], BM_SETCHECK, deaf as usize, 0);
     set_text(c[20], if live { "Stop Live" } else { "Go Live" });
+    let pings = state().pings.len();
+    set_text(c[22], &if pings > 0 { format!("Chat ({pings} @)") } else { "Chat".to_string() });
     set_text(c[9], &key_txt);
     EnableWindow(c[9], (mode == MicMode::Ptt || key_txt.starts_with("Press")) as i32);
 
@@ -852,9 +867,10 @@ unsafe fn refresh() {
     update_overlay();
     update_viewer();
     crate::ui_live::update();
+    crate::ui_chat::update();
 }
 
-unsafe fn update_devices(c: &[HWND; 22]) {
+unsafe fn update_devices(c: &[HWND; 23]) {
     let (ins, outs, mic, spk) = {
         let s = state();
         (s.input_devices.clone(), s.output_devices.clone(), s.mic_device.clone(), s.spk_device.clone())
